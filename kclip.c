@@ -28,20 +28,20 @@
 #define KCLIP_DEFAULT_MAX_PARTS        16
 #define KCLIP_DEFAULT_MAX_DEPTH        128
 #define KCLIP_DEFAULT_MAX_BYTES_TOTAL  (128ULL * 1024 * 1024)  /* 128 MiB */
-#define KCLIP_DEFAULT_POLICY_FLAGS     UCLIP_LIMITS_F_EVICT_LRU
-#define KCLIP_IOC_BIND_SLOT _IOW('K', 0x30, struct uclip_bind_slot)
+#define KCLIP_DEFAULT_POLICY_FLAGS     KCLIP_LIMITS_F_EVICT_LRU
+#define KCLIP_IOC_BIND_SLOT _IOW('K', 0x30, struct kclip_bind_slot)
 
 #define KCLIP_ABI_CHECK(_dst, _userp, _type)                                \
 	do {                                                                    \
 		if (copy_from_user(&(_dst), (void __user *)(_userp), sizeof(_dst))) \
 			return -EFAULT;                                                 \
-		if ((_dst).abi_version != UCLIP_ABI_VERSION)                        \
+		if ((_dst).abi_version != KCLIP_ABI_VERSION)                        \
 			return -EPROTO;                                                 \
 		if ((_dst).struct_size != sizeof(_type))                            \
 			return -EINVAL;                                                 \
 	} while (0)
 
-struct uclip_bind_slot {
+struct kclip_bind_slot {
 	__u32 abi_version;
 	__u32 struct_size;
 	__u32 slot; /* 0..KCLIP_SLOTS_PER_USER-1 */
@@ -53,7 +53,7 @@ struct kclip_part_k {
 	/* immutable after enqueue */
 	struct file   *memfd;      /* get_file() at push; fput() at free */
 	u64            size;       /* bytes valid */
-	u64            flags;      /* UCLIP_PART_F_* */
+	u64            flags;      /* KCLIP_PART_F_* */
 	struct kclip_mime mime;    /* copied from user, len-authoritative */
 	/* optional: u64 off; // if using a shared memfd for multiple parts */
 };
@@ -93,7 +93,7 @@ struct kclip_slot {
 	u32 max_parts;                 /* per-message cap */
 	u32 max_depth;                 /* per-slot cap (messages) */
 	u64 max_bytes_total;           /* per-slot cap (bytes) */
-	u32 policy_flags;              /* UCLIP_LIMITS_F_* */
+	u32 policy_flags;              /* KCLIP_LIMITS_F_* */
 };
 
 /* Lifetime counters per slot (ever) */
@@ -116,12 +116,10 @@ struct kclip_user {
 
 /* Global registry: kuid -> kclip_user */
 static DEFINE_MUTEX(g_users_lock);                 /* serialize create/remove */
-static DEFINE_XARRAY_FLAGS(g_users, XA_FLAGS_LOCK_IRQ); /* RCU-friendly map */
+static DEFINE_XARRAY(g_users);
 
-/* Device singleton now only carries miscdev (no global queue) */
-struct kclip_dev {
-	struct miscdevice mdev;
-};
+static struct miscdevice kclip_miscdev;
+static inline void kclip_msg_free(struct kclip_msg *m);
 
 static inline void kclip_slot_init(struct kclip_slot *s)
 {
@@ -299,11 +297,14 @@ kclip_user_get_or_create_current(void)
 			kclip_user_put(u); /* releases and frees */
 			return exist;
 		}
+		xa_lock(&g_users);
 		if (xa_err(xa_store(&g_users, __kuid_val(kuid), u, GFP_KERNEL))) {
-			mutex_unlock(&g_users_lock);
-			kclip_user_put(u);
-			return NULL;
-		}
+			xa_unlock(&g_users);
+			 mutex_unlock(&g_users_lock);
+			 kclip_user_put(u);
+			 return NULL;
+		     }
+		xa_unlock(&g_users);
 	}
 	kclip_user_get(u);
 	mutex_unlock(&g_users_lock);
@@ -316,9 +317,10 @@ static inline void kclip_user_erase(kuid_t kuid)
 	struct kclip_user *u;
 
 	mutex_lock(&g_users_lock);
+	xa_lock(&g_users);
 	u = xa_erase(&g_users, __kuid_val(kuid));
+	xa_unlock(&g_users);
 	mutex_unlock(&g_users_lock);
-
 	if (u)
 		kclip_user_put(u); /* drop our ref; may free via RCU */
 }
@@ -429,7 +431,7 @@ static inline int kclip_get_slot_for_current_user(u32 slot_id,
 }
 
 /* Pick a "primary" MIME for head_info: prefer PART_F_PRIMARY; else first part. */
-static inline void kclip_pick_primary_mime(struct kclip_msg *m, struct uclip_mime *out)
+static inline void kclip_pick_primary_mime(struct kclip_msg *m, struct kclip_mime *out)
 {
 	u32 i;
 
@@ -438,7 +440,7 @@ static inline void kclip_pick_primary_mime(struct kclip_msg *m, struct uclip_mim
 		return;
 
 	for (i = 0; i < m->parts_count; i++) {
-		if (m->parts[i].flags & UCLIP_PART_F_PRIMARY) {
+		if (m->parts[i].flags & KCLIP_PART_F_PRIMARY) {
 			*out = m->parts[i].mime;
 			return;
 		}
@@ -448,7 +450,7 @@ static inline void kclip_pick_primary_mime(struct kclip_msg *m, struct uclip_mim
 
 static long kclip_ioc_head(unsigned long arg)
 {
-	struct uclip_head_info inout;
+	struct kclip_head_info inout;
 	struct kclip_user *u = NULL;
 	struct kclip_slot *s = NULL;
 	struct kclip_counters *ctr = NULL;
@@ -456,7 +458,7 @@ static long kclip_ioc_head(unsigned long arg)
 	struct kclip_msg *m = NULL;
 	int ret;
 
-	KCLIP_ABI_CHECK(inout, arg, struct uclip_head_info);
+	KCLIP_ABI_CHECK(inout, arg, struct kclip_head_info);
 
 	ret = kclip_get_slot_for_current_user(inout.slot, &u, &s, &ctr);
 	if (ret)
@@ -489,11 +491,11 @@ static long kclip_ioc_head(unsigned long arg)
 
 static long kclip_ioc_slot_list(unsigned long arg)
 {
-	struct uclip_slot_list hdr;
+	struct kclip_slot_list hdr;
 	struct kclip_user *u = NULL;
 	u32 i, to_fill;
 
-	KCLIP_ABI_CHECK(hdr, arg, struct uclip_slot_list);
+	KCLIP_ABI_CHECK(hdr, arg, struct kclip_slot_list);
 
 	/* We ignore hdr.in_cap==0 gracefully (no entries returned). */
 	if (hdr.in_cap > KCLIP_SLOTS_PER_USER)
@@ -511,7 +513,7 @@ static long kclip_ioc_slot_list(unsigned long arg)
 
 	to_fill = hdr.in_cap;
 	for (i = 0; i < to_fill; i++) {
-		struct uclip_slot_entry ent;
+		struct kclip_slot_entry ent;
 		struct kclip_slot *s = &u->slots[i];
 		unsigned long flags;
 
@@ -543,14 +545,14 @@ static long kclip_ioc_slot_list(unsigned long arg)
 
 static long kclip_ioc_limits_get(unsigned long arg)
 {
-	struct uclip_limits lim;
+	struct kclip_limits lim;
 	struct kclip_user *u = NULL;
 	struct kclip_slot *s = NULL;
 	struct kclip_counters *ctr = NULL;
 	unsigned long flags;
 	int ret;
 
-	KCLIP_ABI_CHECK(lim, arg, struct uclip_limits);
+	KCLIP_ABI_CHECK(lim, arg, struct kclip_limits);
 
 	if (lim.scope == 0) /* global */
 		return -EOPNOTSUPP;
@@ -579,14 +581,14 @@ static long kclip_ioc_limits_get(unsigned long arg)
 
 static long kclip_ioc_limits_set(unsigned long arg)
 {
-	struct uclip_limits lim;
+	struct kclip_limits lim;
 	struct kclip_user *u = NULL;
 	struct kclip_slot *s = NULL;
 	struct kclip_counters *ctr = NULL;
 	unsigned long flags;
 	int ret;
 
-	KCLIP_ABI_CHECK(lim, arg, struct uclip_limits);
+	KCLIP_ABI_CHECK(lim, arg, struct kclip_limits);
 
 	if (lim.scope == 0) /* global */
 		return -EOPNOTSUPP;
@@ -619,14 +621,14 @@ static long kclip_ioc_limits_set(unsigned long arg)
 
 static long kclip_ioc_stats_get(unsigned long arg)
 {
-	struct uclip_stats st;
+	struct kclip_stats st;
 	struct kclip_user *u = NULL;
 	struct kclip_slot *s = NULL;
 	struct kclip_counters *ctr = NULL;
 	unsigned long flags;
 	int ret;
 
-	KCLIP_ABI_CHECK(st, arg, struct uclip_stats);
+	KCLIP_ABI_CHECK(st, arg, struct kclip_stats);
 
 	ret = kclip_get_slot_for_current_user(st.slot, &u, &s, &ctr);
 	if (ret)
@@ -650,14 +652,14 @@ static long kclip_ioc_stats_get(unsigned long arg)
 
 static long kclip_ioc_eventfd(unsigned long arg)
 {
-	struct uclip_eventfd ev;
+	struct kclip_eventfd ev;
 	struct kclip_user *u = NULL;
 	struct kclip_slot *s = NULL;
 	struct kclip_counters *ctr = NULL;
 	unsigned long flags;
 	int ret;
 
-	KCLIP_ABI_CHECK(ev, arg, struct uclip_eventfd);
+	KCLIP_ABI_CHECK(ev, arg, struct kclip_eventfd);
 
 	ret = kclip_get_slot_for_current_user(ev.slot, &u, &s, &ctr);
 	if (ret)
@@ -698,9 +700,9 @@ static long kclip_ioc_eventfd(unsigned long arg)
 
 static long kclip_ioc_bind_slot(struct file *filp, unsigned long arg)
 {
-	struct uclip_bind_slot bs;
+	struct kclip_bind_slot bs;
 
-	KCLIP_ABI_CHECK(bs, arg, struct uclip_bind_slot);
+	KCLIP_ABI_CHECK(bs, arg, struct kclip_bind_slot);
 	if (bs.slot >= KCLIP_SLOTS_PER_USER)
 		return -EINVAL;
 
@@ -797,6 +799,37 @@ err:
 	return -EMFILE;
 }
 
+static inline int kclip_check_memfd_and_seals(struct file *file, bool require_seals)
+{
+	int seals;
+
+	/* Must be tmpfs/shmem (memfd uses shmem internally). */
+	if (!file || !file->f_mapping || !shmem_mapping(file->f_mapping))
+		return -EINVAL;
+
+	if (!require_seals)
+		return 0;
+
+	/* Fetch memfd seals; negative means not a sealable shmem file. */
+	seals = shmem_get_seals(file);
+	if (seals < 0)
+		return seals;
+
+	/* Require content/size immutability. */
+	if (!(seals & F_SEAL_WRITE))
+		return -EPERM;
+	if (!((seals & F_SEAL_SHRINK) && (seals & F_SEAL_GROW)))
+		return -EPERM;
+
+	/* Stronger guarantee: prevent seals from being changed later. */
+#ifdef F_SEAL_SEAL
+	if (!(seals & F_SEAL_SEAL))
+		return -EPERM;
+#endif
+
+	return 0;
+}
+
 static int kclip_build_msg_from_user(struct kclip_slot *s,
 				     const struct kclip_msg_publish *pub,
 				     struct kclip_msg **out)
@@ -869,15 +902,6 @@ fail:
 	return ret;
 }
 
-static inline int kclip_check_memfd_and_seals(struct file *file, bool require_seals)
-{
-	/* Must be tmpfs/shmem (memfd uses shmem internally). */
-	if (!file || !file->f_mapping || !shmem_mapping(file->f_mapping))
-		return -EINVAL;
-
-	if (!require_seals)
-		return 0;
-}
 
 static long kclip_ioc_msg_publish(struct file *filp, unsigned long arg)
 {
@@ -1164,7 +1188,7 @@ static int __init kclip_init(void)
 		g_dev = NULL;
 		return ret;
 	}
-	pr_info("kclip: registered /dev/kclip (ABI v%d)\n", UCLIP_ABI_VERSION);
+	pr_info("kclip: registered /dev/kclip (ABI v%d)\n", KCLIP_ABI_VERSION);
 	return 0;
 }
 
