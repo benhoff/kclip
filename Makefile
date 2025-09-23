@@ -1,71 +1,86 @@
-# Makefile for the Clipboard Kernel Module
+# =========================================
+# Top-level Makefile: Kernel module + tools
+# =========================================
 
-# ================================
-# Version Integration
-# ================================
+# ---- Version ----
+# Prefer VERSION file; fall back to git describe; else 0.0.0
+VERSION := $(shell (cat $(CURDIR)/VERSION) 2>/dev/null || git describe --tags --always 2>/dev/null || echo 0.0.0)
 
-# Read the version from the VERSION file using an absolute path
-VERSION := $(shell cat $(PWD)/VERSION)
+# ---- Paths / Config (override on command line if needed) ----
+KDIR      ?= /lib/modules/$(shell uname -r)/build
+DEST_DIR  ?= /lib/modules/$(shell uname -r)/extra
+USR_DIR   ?= userspace
+UAPI_DIR  ?= $(CURDIR)/include
 
-# ================================
-# Module Configuration
-# ================================
+# ---- Module names/sources ----
+MODULE_NAME := kclip
+obj-m       += $(MODULE_NAME).o
 
-# Name of the module
-MODULE_NAME := clipboard
+# Make kernel see our UAPI headers
+ccflags-y += -I$(UAPI_DIR) -DCLIPBOARD_MODULE_VERSION=\"$(VERSION)\"
 
-# Kernel build directory
-KERNEL_DIR := /lib/modules/$(shell uname -r)/build
+# --------------------
+# Phony meta targets
+# --------------------
+.PHONY: all kmod userspace clean kmod-clean userspace-clean install kmod-install uninstall print-vars
 
-# Source files
-SRC_FILES := clipboard_main.c clipboard_helpers.c
+# Default: build kernel module + userspace tools (if present)
+all: kmod userspace
 
-# Object files
-OBJ_FILES := $(SRC_FILES:.c=.o)
+# --------------------
+# Kernel module build
+# --------------------
+kmod:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
-# Destination directory for compiled module
-DEST_DIR := /lib/modules/$(shell uname -r)/extra
+kmod-clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
 
-# Module to be built from object files
-obj-m := $(MODULE_NAME).o
-$(MODULE_NAME)-objs := clipboard_main.o clipboard_helpers.o
-
-# ================================
-# Compiler Flags
-# ================================
-
-# Pass the module version as a compiler flag using a different macro
-# This avoids redefining MODULE_VERSION and prevents conflicts
-ccflags-y += -DCLIPBOARD_MODULE_VERSION=\"$(VERSION)\"
-
-# ================================
-# Build Targets
-# ================================
-
-# Default target: Build the module
-all:
-	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
-
-# Clean target: Clean the build artifacts
-clean:
-	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
-
-# Install target: Install the compiled module to the destination directory
-install: all
-	@sudo mkdir -p $(DEST_DIR)
-	@sudo cp $(MODULE_NAME).ko $(DEST_DIR)
+# Install via manual copy into /extra (kept for compatibility)
+install: kmod
+	@sudo mkdir -p "$(DEST_DIR)"
+	@sudo cp -v $(MODULE_NAME).ko "$(DEST_DIR)/"
 	@sudo depmod -a
-	@echo "Module $(MODULE_NAME) version $(VERSION) installed to $(DEST_DIR)"
+	@echo "Installed $(MODULE_NAME) v$(VERSION) to $(DEST_DIR)"
 
-# Uninstall target: Remove the installed module from the destination directory
+# Preferred: use kernel's modules_install path (places under /lib/modules/…)
+kmod-install: kmod
+	@sudo $(MAKE) -C $(KDIR) M=$(CURDIR) modules_install
+	@sudo depmod -a
+	@echo "Installed $(MODULE_NAME) v$(VERSION) via modules_install"
+
 uninstall:
-	@sudo rm -f $(DEST_DIR)/$(MODULE_NAME).ko
+	@sudo rm -f "$(DEST_DIR)/$(MODULE_NAME).ko" || true
 	@sudo depmod -a
-	@echo "Module $(MODULE_NAME) removed from $(DEST_DIR)"
+	@echo "Removed $(MODULE_NAME) from $(DEST_DIR)"
 
-# ================================
-# Phony Targets
-# ================================
+# --------------------
+# Userspace build
+# --------------------
+# Build userspace tools if a Makefile exists in userspace/
+userspace:
+	@if [ -f "$(USR_DIR)/Makefile" ]; then \
+		$(MAKE) -C "$(USR_DIR)"; \
+	else \
+		echo "(userspace) nothing to build (missing $(USR_DIR)/Makefile)"; \
+	fi
 
-.PHONY: all clean install uninstall
+userspace-clean:
+	@if [ -f "$(USR_DIR)/Makefile" ]; then \
+		$(MAKE) -C "$(USR_DIR)" clean; \
+	fi
+
+# Top-level clean
+clean: kmod-clean userspace-clean
+
+# Debug helper
+print-vars:
+	@echo "VERSION   = $(VERSION)"
+	@echo "KDIR      = $(KDIR)"
+	@echo "DEST_DIR  = $(DEST_DIR)"
+	@echo "USR_DIR   = $(USR_DIR)"
+	@echo "UAPI_DIR  = $(UAPI_DIR)"
+
+# ---- Kbuild footer (required by out-of-tree module builds) ----
+# (kept at end so 'make -C $(KDIR) M=$(CURDIR) modules' can see it)
 

@@ -20,7 +20,11 @@
 #include <linux/shmem_fs.h>  /* shmem_mapping() */
 #include <uapi/linux/fcntl.h> /* F_SEAL_* bits for documentation */
 
-
+#include <linux/shmem_fs.h>
+#include <linux/ktime.h>
+#include <linux/overflow.h>
+#include <linux/file.h>
+#include <linux/fdtable.h>
 
 #include "include/uapi/kclip_uapi.h"
 
@@ -29,7 +33,6 @@
 #define KCLIP_DEFAULT_MAX_DEPTH        128
 #define KCLIP_DEFAULT_MAX_BYTES_TOTAL  (128ULL * 1024 * 1024)  /* 128 MiB */
 #define KCLIP_DEFAULT_POLICY_FLAGS     KCLIP_LIMITS_F_EVICT_LRU
-#define KCLIP_IOC_BIND_SLOT _IOW('K', 0x30, struct kclip_bind_slot)
 
 #define KCLIP_ABI_CHECK(_dst, _userp, _type)                                \
 	do {                                                                    \
@@ -40,13 +43,6 @@
 		if ((_dst).struct_size != sizeof(_type))                            \
 			return -EINVAL;                                                 \
 	} while (0)
-
-struct kclip_bind_slot {
-	__u32 abi_version;
-	__u32 struct_size;
-	__u32 slot; /* 0..KCLIP_SLOTS_PER_USER-1 */
-	__u32 _pad;
-};
 
 /* One in-kernel part (kernel view of a UAPI kclip_part) */
 struct kclip_part_k {
@@ -119,6 +115,12 @@ static DEFINE_MUTEX(g_users_lock);                 /* serialize create/remove */
 static DEFINE_XARRAY(g_users);
 
 static struct miscdevice kclip_miscdev;
+
+struct kclip_fctx {
+	struct kclip_user *u;
+	u32 slot;
+};
+
 static inline void kclip_msg_free(struct kclip_msg *m);
 
 static inline void kclip_slot_init(struct kclip_slot *s)
@@ -450,7 +452,7 @@ static inline void kclip_pick_primary_mime(struct kclip_msg *m, struct kclip_mim
 
 static long kclip_ioc_head(unsigned long arg)
 {
-	struct kclip_head_info inout;
+	struct kclip_head inout;
 	struct kclip_user *u = NULL;
 	struct kclip_slot *s = NULL;
 	struct kclip_counters *ctr = NULL;
@@ -458,7 +460,7 @@ static long kclip_ioc_head(unsigned long arg)
 	struct kclip_msg *m = NULL;
 	int ret;
 
-	KCLIP_ABI_CHECK(inout, arg, struct kclip_head_info);
+	KCLIP_ABI_CHECK(inout, arg, struct kclip_head);
 
 	ret = kclip_get_slot_for_current_user(inout.slot, &u, &s, &ctr);
 	if (ret)
@@ -719,7 +721,7 @@ static inline void kclip_signal_nonempty(struct kclip_slot *s)
 {
 	/* eventfd fires only on empty->non-empty edge */
 	if (s->efd && s->efd_armed && s->depth > 0) {
-		eventfd_signal(s->efd, 1);
+		eventfd_signal(s->efd);
 		s->efd_armed = false;
 	}
 	/* epoll waiters */
@@ -801,107 +803,87 @@ err:
 
 static inline int kclip_check_memfd_and_seals(struct file *file, bool require_seals)
 {
-	int seals;
+    if (!file || !file->f_mapping || !shmem_mapping(file->f_mapping))
+        return -EINVAL;
 
-	/* Must be tmpfs/shmem (memfd uses shmem internally). */
-	if (!file || !file->f_mapping || !shmem_mapping(file->f_mapping))
-		return -EINVAL;
+    if (!require_seals)
+        return 0;
 
-	if (!require_seals)
-		return 0;
-
-	/* Fetch memfd seals; negative means not a sealable shmem file. */
-	seals = shmem_get_seals(file);
-	if (seals < 0)
-		return seals;
-
-	/* Require content/size immutability. */
-	if (!(seals & F_SEAL_WRITE))
-		return -EPERM;
-	if (!((seals & F_SEAL_SHRINK) && (seals & F_SEAL_GROW)))
-		return -EPERM;
-
-	/* Stronger guarantee: prevent seals from being changed later. */
-#ifdef F_SEAL_SEAL
-	if (!(seals & F_SEAL_SEAL))
-		return -EPERM;
-#endif
-
-	return 0;
+    /* Strict seals not enforceable from module on this kernel. */
+    return -EOPNOTSUPP;
 }
+
 
 static int kclip_build_msg_from_user(struct kclip_slot *s,
-				     const struct kclip_msg_publish *pub,
-				     struct kclip_msg **out)
+                                     const struct kclip_msg_publish *pub,
+                                     struct kclip_msg **out)
 {
-	int ret = 0;
-	u32 i;
-	u64 total = 0;
-	struct kclip_msg *m = NULL;
-	struct kclip_part __user *uparts;
-	size_t uparts_sz;
+    int ret = 0;
+    u32 i;
+    u64 total = 0;
+    struct kclip_msg *m = NULL;
+    struct kclip_part __user *uparts;
+    size_t uparts_sz;
 
-	if (pub->parts_count == 0 || pub->parts_count > s->max_parts)
-		return -EINVAL;
+    if (pub->parts_count == 0 || pub->parts_count > s->max_parts)
+        return -EINVAL;
 
-	m = kclip_msg_alloc(pub->parts_count, GFP_KERNEL);
-	if (!m)
-		return -ENOMEM;
+    m = kclip_msg_alloc(pub->parts_count, GFP_KERNEL);
+    if (!m)
+        return -ENOMEM;
 
-	uparts = (struct kclip_part __user *)(uintptr_t)pub->parts_ptr;
-	uparts_sz = sizeof(struct kclip_part);
+    uparts = (struct kclip_part __user *)(uintptr_t)pub->parts_ptr;
+    uparts_sz = sizeof(struct kclip_part);
 
-	for (i = 0; i < pub->parts_count; i++) {
-		struct kclip_part up;
-		struct fd f;
+    for (i = 0; i < pub->parts_count; i++) {
+        struct kclip_part up;
+        struct file *filp;
 
-		if (copy_from_user(&up, uparts + i, uparts_sz)) {
-			ret = -EFAULT;
-			goto fail;
-		}
-		/* size/mime sanity */
-		if (!up.size || up.size > s->max_msg_bytes) { ret = -EINVAL; goto fail; }
-		if (up.mime.len > KCLIP_MIME_MAX)            { ret = -EINVAL; goto fail; }
+        if (copy_from_user(&up, uparts + i, uparts_sz)) {
+            ret = -EFAULT;
+            goto fail;
+        }
+        /* size/mime sanity */
+        if (!up.size || up.size > s->max_msg_bytes) { ret = -EINVAL; goto fail; }
+        if (up.mime.len > KCLIP_MIME_MAX)            { ret = -EINVAL; goto fail; }
 
-		if (check_add_overflow(total, up.size, &total)) { ret = -E2BIG; goto fail; }
-		if (total > s->max_msg_bytes)                  { ret = -E2BIG; goto fail; }
+        if (check_add_overflow(total, up.size, &total)) { ret = -E2BIG; goto fail; }
+        if (total > s->max_msg_bytes)                  { ret = -E2BIG; goto fail; }
 
-		f = fdget(up.memfd_fd);
-		if (!f.file) { ret = -EBADF; goto fail; }
+        /* get a ref to the file for this fd */
+        filp = fget(up.memfd_fd);
+        if (!filp) { ret = -EBADF; goto fail; }
 
-		/* NEW: require memfd/shmem, and enforce seals if requested */
-		ret = kclip_check_memfd_and_seals(f.file,
-			!!(pub->flags & KCLIP_PUBLISH_F_REQUIRE_SEALS));
-		if (ret) {
-			fdput(f);
-			goto fail;
-		}
+        /* require memfd/shmem; enforce seals if requested (module-safe version) */
+        ret = kclip_check_memfd_and_seals(filp,
+                  !!(pub->flags & KCLIP_PUBLISH_F_REQUIRE_SEALS));
+        if (ret) {
+            fput(filp);
+            goto fail;
+        }
 
-		/* Accept the file: hold our own ref; record metadata */
-		m->parts[i].memfd = get_file(f.file);
-		m->parts[i].size  = up.size;
-		m->parts[i].flags = up.flags;
-		m->parts[i].mime.len = up.mime.len;
-		if (up.mime.len)
-			memcpy(m->parts[i].mime.s, up.mime.s, up.mime.len);
+        /* Accept the file: keep our ref; record metadata */
+        m->parts[i].memfd     = filp;      /* kclip_msg_free() will fput() */
+        m->parts[i].size      = up.size;
+        m->parts[i].flags     = up.flags;
+        m->parts[i].mime.len  = up.mime.len;
+        if (up.mime.len)
+            memcpy(m->parts[i].mime.s, up.mime.s, up.mime.len);
+    }
 
-		fdput(f);
-	}
+    m->total_size = total;
+    m->meta.ts_ns = ktime_get_ns();
+    m->meta.uid   = from_kuid_munged(&init_user_ns, current_fsuid());
+    m->meta.pid   = task_pid_nr(current);
+    strscpy(m->meta.comm, current->comm, sizeof(m->meta.comm));
 
-	m->total_size   = total;
-	m->meta.ts_ns   = ktime_get_ns();
-	m->meta.uid     = from_kuid_munged(&init_user_ns, current_fsuid());
-	m->meta.pid     = task_pid_nr(current);
-	strscpy(m->meta.comm, current->comm, sizeof(m->meta.comm));
-
-	*out = m;
-	return 0;
+    *out = m;
+    return 0;
 
 fail:
-	kclip_msg_free(m);
-	return ret;
+    kclip_msg_free(m);  /* will fput() any parts already set */
+    return ret;
 }
-
 
 static long kclip_ioc_msg_publish(struct file *filp, unsigned long arg)
 {
@@ -1165,28 +1147,14 @@ static const struct file_operations kclip_fops = {
 /* ===== module init / exit ===== */
 static int __init kclip_init(void)
 {
-	int ret;
-	struct kclip_dev *dev;
-
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (!dev)
-		return -ENOMEM;
-
-	/* If you’re keeping a “slot0” for the skeleton poll path: */
-	kclip_slot_init(&dev->slot0);
-
-	g_dev = dev;
-
-	dev->mdev.minor = MISC_DYNAMIC_MINOR;
-	dev->mdev.name  = "kclip";
-	dev->mdev.fops  = &kclip_fops;
-	dev->mdev.mode  = 0666;
-
-	ret = misc_register(&dev->mdev);
-	if (ret) {
-		kfree(dev);
-		g_dev = NULL;
-		return ret;
+	kclip_miscdev.minor = MISC_DYNAMIC_MINOR;
+	kclip_miscdev.name  = "kclip";
+	kclip_miscdev.fops  = &kclip_fops;
+	kclip_miscdev.mode  = 0666;
+	{
+		int ret = misc_register(&kclip_miscdev);
+		if (ret)
+			return ret;
 	}
 	pr_info("kclip: registered /dev/kclip (ABI v%d)\n", KCLIP_ABI_VERSION);
 	return 0;
@@ -1194,18 +1162,7 @@ static int __init kclip_init(void)
 
 static void __exit kclip_exit(void)
 {
-	struct kclip_dev *dev = g_dev;
-
-	if (!dev)
-		return;
-
-	misc_deregister(&dev->mdev);
-
-	/* drain the dummy slot if you used it */
-	kclip_slot_fini(&dev->slot0);
-
-	kfree(dev);
-	g_dev = NULL;
+	misc_deregister(&kclip_miscdev);
 	pr_info("kclip: unloaded\n");
 }
 
