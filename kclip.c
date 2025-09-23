@@ -299,14 +299,11 @@ kclip_user_get_or_create_current(void)
 			kclip_user_put(u); /* releases and frees */
 			return exist;
 		}
-		xa_lock(&g_users);
 		if (xa_err(xa_store(&g_users, __kuid_val(kuid), u, GFP_KERNEL))) {
-			xa_unlock(&g_users);
-			 mutex_unlock(&g_users_lock);
-			 kclip_user_put(u);
-			 return NULL;
-		     }
-		xa_unlock(&g_users);
+		    mutex_unlock(&g_users_lock);
+		    kclip_user_put(u);
+		    return NULL;
+		}
 	}
 	kclip_user_get(u);
 	mutex_unlock(&g_users_lock);
@@ -317,11 +314,8 @@ kclip_user_get_or_create_current(void)
 static inline void kclip_user_erase(kuid_t kuid)
 {
 	struct kclip_user *u;
-
 	mutex_lock(&g_users_lock);
-	xa_lock(&g_users);
 	u = xa_erase(&g_users, __kuid_val(kuid));
-	xa_unlock(&g_users);
 	mutex_unlock(&g_users_lock);
 	if (u)
 		kclip_user_put(u); /* drop our ref; may free via RCU */
