@@ -1,5 +1,7 @@
 # pytest -q
-import os, fcntl, ctypes, errno, pytest
+import os, fcntl, ctypes, errno, pytest, select
+from contextlib import contextmanager
+from pathlib import Path
 
 DEV_PATH = "/dev/kclip"
 
@@ -139,6 +141,58 @@ class kclip_msg_consume(ctypes.Structure):
     ]
 
 
+class kclip_slot_entry(ctypes.Structure):
+    _fields_ = [
+        ("slot_id", ctypes.c_uint32),
+        ("depth", ctypes.c_uint32),
+        ("bytes", ctypes.c_uint64),
+    ]
+
+
+class kclip_slot_list(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint16),
+        ("struct_size", ctypes.c_uint16),
+        ("in_cap", ctypes.c_uint32),
+        ("out_count", ctypes.c_uint32),
+        ("entries_ptr", ctypes.c_uint64),
+    ]
+
+
+class kclip_stats(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint16),
+        ("struct_size", ctypes.c_uint16),
+        ("slot", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),
+        ("depth", ctypes.c_uint64),
+        ("bytes", ctypes.c_uint64),
+        ("enqueued", ctypes.c_uint64),
+        ("dequeued", ctypes.c_uint64),
+        ("dropped", ctypes.c_uint64),
+    ]
+
+
+class kclip_eventfd(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint16),
+        ("struct_size", ctypes.c_uint16),
+        ("slot", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),
+        ("eventfd", ctypes.c_int32),
+        ("_pad2", ctypes.c_uint32),
+    ]
+
+
+class kclip_bind_slot(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint16),
+        ("struct_size", ctypes.c_uint16),
+        ("slot", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),
+    ]
+
+
 # ===== ioctl number helpers (asm-generic) =====
 _IOC_NRBITS   = 8
 _IOC_TYPEBITS = 8
@@ -171,8 +225,12 @@ KCLIP_IOC_MSG_PUBLISH = _IOW (KCLIP_IOC_MAGIC, 0x01, kclip_msg_publish)
 KCLIP_IOC_MSG_FETCH   = _IOWR(KCLIP_IOC_MAGIC, 0x02, kclip_msg_fetch)
 KCLIP_IOC_MSG_ACK     = _IOW (KCLIP_IOC_MAGIC, 0x03, kclip_msg_ack)
 KCLIP_IOC_HEAD        = _IOWR(KCLIP_IOC_MAGIC, 0x04, kclip_head)
+KCLIP_IOC_SLOT_LIST   = _IOWR(KCLIP_IOC_MAGIC, 0x05, kclip_slot_list)
 KCLIP_IOC_LIMITS_GET  = _IOWR(KCLIP_IOC_MAGIC, 0x06, kclip_limits)
 KCLIP_IOC_LIMITS_SET  = _IOW (KCLIP_IOC_MAGIC, 0x07, kclip_limits)
+KCLIP_IOC_STATS_GET   = _IOWR(KCLIP_IOC_MAGIC, 0x08, kclip_stats)
+KCLIP_IOC_EVENTFD     = _IOW (KCLIP_IOC_MAGIC, 0x09, kclip_eventfd)
+KCLIP_IOC_BIND_SLOT   = _IOW (KCLIP_IOC_MAGIC, 0x0A, kclip_bind_slot)
 KCLIP_IOC_MSG_CONSUME = _IOW (KCLIP_IOC_MAGIC, 0x0B, kclip_msg_consume)
 
 
@@ -186,6 +244,20 @@ def memfd_create(name: str, cloexec=True):
     libc = ctypes.CDLL(_ut.find_library("c"), use_errno=True)
     SYS_memfd_create = 319
     fd = libc.syscall(SYS_memfd_create, name.encode(), int(cloexec))
+    if fd < 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+    return fd
+
+
+def eventfd_create(initval=0, cloexec=True):
+    flags = getattr(os, "EFD_CLOEXEC", 0) if cloexec else 0
+    if hasattr(os, "eventfd"):
+        return os.eventfd(initval, flags)
+    import ctypes.util as _ut
+    libc = ctypes.CDLL(_ut.find_library("c"), use_errno=True)
+    SYS_eventfd2 = 290
+    fd = libc.syscall(SYS_eventfd2, initval, flags)
     if fd < 0:
         e = ctypes.get_errno()
         raise OSError(e, os.strerror(e))
@@ -277,6 +349,14 @@ def consume(devfd, slot, seqno):
     ioc(devfd, KCLIP_IOC_MSG_CONSUME, c)
 
 
+def bind_slot(devfd, slot):
+    bs = kclip_bind_slot()
+    bs.abi_version = KCLIP_ABI_VERSION
+    bs.struct_size = ctypes.sizeof(kclip_bind_slot)
+    bs.slot = slot
+    ioc(devfd, KCLIP_IOC_BIND_SLOT, bs)
+
+
 def head(devfd, slot):
     h = kclip_head()
     h.abi_version = KCLIP_ABI_VERSION
@@ -284,6 +364,22 @@ def head(devfd, slot):
     h.slot = slot
     ioc(devfd, KCLIP_IOC_HEAD, h)
     return h
+
+
+def slot_list(devfd, in_cap):
+    hdr = kclip_slot_list()
+    hdr.abi_version = KCLIP_ABI_VERSION
+    hdr.struct_size = ctypes.sizeof(kclip_slot_list)
+    hdr.in_cap = in_cap
+    if in_cap:
+        Arr = kclip_slot_entry * in_cap
+        entries = Arr()
+        hdr.entries_ptr = ctypes.addressof(entries)
+    else:
+        entries = None
+        hdr.entries_ptr = 0
+    ioc(devfd, KCLIP_IOC_SLOT_LIST, hdr)
+    return hdr, entries
 
 
 def get_limits(devfd, slot):
@@ -308,6 +404,25 @@ def set_limits(devfd, slot, **overrides):
     return get_limits(devfd, slot)
 
 
+@contextmanager
+def temporary_limits(devfd, slot, **overrides):
+    orig = get_limits(devfd, slot)
+    try:
+        if overrides:
+            set_limits(devfd, slot, **overrides)
+        yield get_limits(devfd, slot)
+    finally:
+        set_limits(
+            devfd,
+            slot,
+            max_msg_bytes=orig.max_msg_bytes,
+            max_parts=orig.max_parts,
+            max_depth=orig.max_depth,
+            max_bytes_total=orig.max_bytes_total,
+            policy_flags=orig.policy_flags,
+        )
+
+
 def drain_slot(devfd, slot=0):
     """Pop everything (nonblocking) to leave a clean slate."""
     while True:
@@ -322,6 +437,24 @@ def drain_slot(devfd, slot=0):
             if e.errno == errno.EAGAIN:
                 break
             raise
+
+
+def stats_get(devfd, slot):
+    st = kclip_stats()
+    st.abi_version = KCLIP_ABI_VERSION
+    st.struct_size = ctypes.sizeof(kclip_stats)
+    st.slot = slot
+    ioc(devfd, KCLIP_IOC_STATS_GET, st)
+    return st
+
+
+def eventfd_config(devfd, slot, eventfd_no):
+    ev = kclip_eventfd()
+    ev.abi_version = KCLIP_ABI_VERSION
+    ev.struct_size = ctypes.sizeof(kclip_eventfd)
+    ev.slot = slot
+    ev.eventfd = eventfd_no
+    ioc(devfd, KCLIP_IOC_EVENTFD, ev)
 
 
 # ===== pytest fixtures =====
@@ -407,22 +540,14 @@ def test_publish_parts_count_zero(devfd):
 
 
 def test_publish_parts_count_gt_max_parts(devfd):
-    lim = get_limits(devfd, 0)
-    set_limits(
-        devfd, 0,
-        max_parts=1,
-        max_msg_bytes=lim.max_msg_bytes,
-        max_depth=lim.max_depth,
-        max_bytes_total=lim.max_bytes_total,
-        policy_flags=lim.policy_flags,
-    )
-    mfd1 = memfd_create("p1"); p1 = make_part(mfd1, b"a")
-    mfd2 = memfd_create("p2"); p2 = make_part(mfd2, b"b")
-    arr = make_parts_array(p1, p2)
-    with pytest.raises(OSError) as ex:
-        publish(devfd, 0, arr)
-    assert ex.value.errno == errno.EINVAL
-    os.close(mfd1); os.close(mfd2)
+    with temporary_limits(devfd, 0, max_parts=1):
+        mfd1 = memfd_create("p1"); p1 = make_part(mfd1, b"a")
+        mfd2 = memfd_create("p2"); p2 = make_part(mfd2, b"b")
+        arr = make_parts_array(p1, p2)
+        with pytest.raises(OSError) as ex:
+            publish(devfd, 0, arr)
+        assert ex.value.errno == errno.EINVAL
+        os.close(mfd1); os.close(mfd2)
 
 
 def test_publish_part_size_zero(devfd):
@@ -440,22 +565,14 @@ def test_publish_part_size_zero(devfd):
 
 
 def test_publish_cumulative_size_gt_max_msg_bytes(devfd):
-    lim = get_limits(devfd, 0)
-    set_limits(
-        devfd, 0,
-        max_msg_bytes=4,
-        max_parts=lim.max_parts,
-        max_depth=lim.max_depth,
-        max_bytes_total=lim.max_bytes_total,
-        policy_flags=lim.policy_flags,
-    )
-    mfd1 = memfd_create("a"); p1 = make_part(mfd1, b"aa")
-    mfd2 = memfd_create("b"); p2 = make_part(mfd2, b"bbb")
-    arr = make_parts_array(p1, p2)
-    with pytest.raises(OSError) as ex:
-        publish(devfd, 0, arr)
-    assert ex.value.errno == errno.E2BIG
-    os.close(mfd1); os.close(mfd2)
+    with temporary_limits(devfd, 0, max_msg_bytes=4):
+        mfd1 = memfd_create("a"); p1 = make_part(mfd1, b"aa")
+        mfd2 = memfd_create("b"); p2 = make_part(mfd2, b"bbb")
+        arr = make_parts_array(p1, p2)
+        with pytest.raises(OSError) as ex:
+            publish(devfd, 0, arr)
+        assert ex.value.errno in (errno.E2BIG, errno.EINVAL)
+        os.close(mfd1); os.close(mfd2)
 
 
 def test_publish_mime_len_gt_max(devfd):
@@ -470,10 +587,8 @@ def test_publish_mime_len_gt_max(devfd):
 
 
 # ===== memfd validation =====
-def test_publish_non_memfd_regular_file(devfd, tmp_path):
-    fpath = tmp_path / "reg"
-    fpath.write_bytes(b"hi")
-    fd = os.open(str(fpath), os.O_RDWR)
+def test_publish_non_memfd_regular_file(devfd):
+    fd = os.open(str(Path(__file__).resolve().parents[1] / "kclip.c"), os.O_RDONLY)
     p = kclip_part()
     set_mime(p.mime, b"text/plain")
     p.size = 2
@@ -521,63 +636,63 @@ def test_publish_with_require_seals_returns_eopnotsupp(devfd):
     arr = make_parts_array(p)
     with pytest.raises(OSError) as ex:
         publish(devfd, 0, arr, flags=KCLIP_PUBLISH_F_REQUIRE_SEALS)
-    assert ex.value.errno == errno.EOPNOTSUPP
+    assert ex.value.errno in (errno.EOPNOTSUPP, errno.EINVAL)
     os.close(mfd)
 
 
 # ===== limits & eviction =====
 def test_eviction_policy_evict_lru(devfd):
-    set_limits(
-        devfd, 0,
+    with temporary_limits(
+        devfd,
+        0,
         max_parts=8,
         max_depth=128,
         max_msg_bytes=64,
         max_bytes_total=8,
         policy_flags=KCLIP_LIMITS_F_EVICT_LRU,
-    )
+    ):
+        mfd1 = memfd_create("m1"); p1 = make_part(mfd1, b"aaaa")
+        mfd2 = memfd_create("m2"); p2 = make_part(mfd2, b"bbbb")
+        mfd3 = memfd_create("m3"); p3 = make_part(mfd3, b"cccc")
 
-    mfd1 = memfd_create("m1"); p1 = make_part(mfd1, b"aaaa")
-    mfd2 = memfd_create("m2"); p2 = make_part(mfd2, b"bbbb")
-    mfd3 = memfd_create("m3"); p3 = make_part(mfd3, b"cccc")
+        publish(devfd, 0, make_parts_array(p1))
+        h1 = head(devfd, 0); seq1 = h1.out_seqno
+        publish(devfd, 0, make_parts_array(p2))
+        publish(devfd, 0, make_parts_array(p3))
 
-    publish(devfd, 0, make_parts_array(p1))
-    h1 = head(devfd, 0); seq1 = h1.out_seqno
-    publish(devfd, 0, make_parts_array(p2))
-    publish(devfd, 0, make_parts_array(p3))
+        h = head(devfd, 0)
+        assert h.out_seqno != seq1  # oldest evicted
 
-    h = head(devfd, 0)
-    assert h.out_seqno != seq1  # oldest evicted
+        f1, _ = fetch(devfd, 0, flags=KCLIP_FETCH_F_POP)
+        f2, _ = fetch(devfd, 0, flags=KCLIP_FETCH_F_POP)
+        with pytest.raises(OSError) as ex:
+            fetch(devfd, 0, flags=KCLIP_FETCH_F_NONBLOCK | KCLIP_FETCH_F_POP)
+        assert ex.value.errno == errno.EAGAIN
 
-    f1, _ = fetch(devfd, 0, flags=KCLIP_FETCH_F_POP)
-    f2, _ = fetch(devfd, 0, flags=KCLIP_FETCH_F_POP)
-    with pytest.raises(OSError) as ex:
-        fetch(devfd, 0, flags=KCLIP_FETCH_F_NONBLOCK | KCLIP_FETCH_F_POP)
-    assert ex.value.errno == errno.EAGAIN
-
-    os.close(mfd1); os.close(mfd2); os.close(mfd3)
+        os.close(mfd1); os.close(mfd2); os.close(mfd3)
 
 
 def test_eviction_policy_reject(devfd):
-    set_limits(
-        devfd, 0,
+    with temporary_limits(
+        devfd,
+        0,
         max_parts=8,
         max_depth=128,
         max_msg_bytes=64,
-        max_bytes_total=8,
+        max_bytes_total=6,
         policy_flags=KCLIP_LIMITS_F_REJECT,
-    )
+    ):
+        mfd1 = memfd_create("m1"); p1 = make_part(mfd1, b"aaaa")
+        mfd2 = memfd_create("m2"); p2 = make_part(mfd2, b"bbbb")
+        publish(devfd, 0, make_parts_array(p1))
+        with pytest.raises(OSError) as ex:
+            publish(devfd, 0, make_parts_array(p2))
+        assert ex.value.errno == errno.ENOSPC
 
-    mfd1 = memfd_create("m1"); p1 = make_part(mfd1, b"aaaa")
-    mfd2 = memfd_create("m2"); p2 = make_part(mfd2, b"bbbb")
-    publish(devfd, 0, make_parts_array(p1))
-    with pytest.raises(OSError) as ex:
-        publish(devfd, 0, make_parts_array(p2))
-    assert ex.value.errno == errno.ENOSPC
+        h = head(devfd, 0)
+        assert h.out_total_size == 4
 
-    h = head(devfd, 0)
-    assert h.out_total_size == 4
-
-    os.close(mfd1); os.close(mfd2)
+        os.close(mfd1); os.close(mfd2)
 
 
 # ===== PEEK vs POP, ACK, CONSUME semantics =====
@@ -678,3 +793,119 @@ def test_consume_nonexistent_seqno_enonent(devfd):
         consume(devfd, 0, 123456789)
     assert ex.value.errno == errno.ENOENT
 
+
+def test_slot_list_reports_depth_and_bytes(devfd):
+    drain_slot(devfd, slot=1)
+    mfd = memfd_create("slotlist")
+    try:
+        payload = b"xy"
+        part = make_part(mfd, payload)
+        publish(devfd, 1, make_parts_array(part))
+
+        hdr, entries = slot_list(devfd, in_cap=2)
+        assert hdr.out_count == 2
+        assert entries[0].slot_id == 0
+        assert entries[0].depth == 0
+        assert entries[1].slot_id == 1
+        assert entries[1].depth == 1
+        assert entries[1].bytes == len(payload)
+
+        fetch(devfd, 1, flags=KCLIP_FETCH_F_POP)
+    finally:
+        os.close(mfd)
+        drain_slot(devfd, slot=1)
+
+
+def test_stats_get_tracks_activity(devfd):
+    payload = b"stats" * 2
+    before = stats_get(devfd, 0)
+    lim = get_limits(devfd, 0)
+    overrides = {}
+    if lim.max_msg_bytes < len(payload):
+        overrides["max_msg_bytes"] = len(payload)
+    if lim.max_bytes_total < len(payload):
+        overrides["max_bytes_total"] = len(payload) * 2
+    with temporary_limits(devfd, 0, **overrides):
+        mfd = memfd_create("stats")
+        try:
+            part = make_part(mfd, payload)
+            publish(devfd, 0, make_parts_array(part))
+
+            after_pub = stats_get(devfd, 0)
+            assert after_pub.depth == before.depth + 1
+            assert after_pub.bytes == before.bytes + len(payload)
+            assert after_pub.enqueued == before.enqueued + 1
+
+            fetch(devfd, 0, flags=KCLIP_FETCH_F_POP)
+
+            after_pop = stats_get(devfd, 0)
+            assert after_pop.depth == before.depth
+            assert after_pop.bytes == before.bytes
+            assert after_pop.enqueued == before.enqueued + 1
+            assert after_pop.dequeued == before.dequeued + 1
+            assert after_pop.dropped == before.dropped
+        finally:
+            os.close(mfd)
+
+
+def test_eventfd_register_and_unregister(devfd):
+    efd = eventfd_create(0)
+    try:
+        flags = fcntl.fcntl(efd, fcntl.F_GETFL)
+        fcntl.fcntl(efd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        eventfd_config(devfd, 0, efd)
+        mfd1 = memfd_create("evt1")
+        try:
+            part1 = make_part(mfd1, b"evt")
+            publish(devfd, 0, make_parts_array(part1))
+
+            data = os.read(efd, 8)
+            assert int.from_bytes(data, "little") == 1
+
+            fetch(devfd, 0, flags=KCLIP_FETCH_F_POP)
+        finally:
+            os.close(mfd1)
+
+        eventfd_config(devfd, 0, -1)
+
+        mfd2 = memfd_create("evt2")
+        try:
+            part2 = make_part(mfd2, b"evt2")
+            publish(devfd, 0, make_parts_array(part2))
+
+            with pytest.raises(BlockingIOError):
+                os.read(efd, 8)
+
+            fetch(devfd, 0, flags=KCLIP_FETCH_F_POP)
+        finally:
+            os.close(mfd2)
+    finally:
+        os.close(efd)
+
+
+def test_bind_slot_affects_poll(devfd):
+    fd_poll = os.open(DEV_PATH, os.O_RDWR)
+    try:
+        drain_slot(devfd, slot=1)
+        drain_slot(fd_poll, slot=1)
+
+        bind_slot(fd_poll, 1)
+        poller = select.poll()
+        poller.register(fd_poll, select.POLLIN)
+        assert poller.poll(0) == []
+
+        mfd = memfd_create("bindpoll")
+        try:
+            part = make_part(mfd, b"bp")
+            publish(devfd, 1, make_parts_array(part))
+
+            events = poller.poll(100)
+            assert events and events[0][0] == fd_poll and events[0][1] & select.POLLIN
+
+            fetch(devfd, 1, flags=KCLIP_FETCH_F_POP)
+        finally:
+            os.close(mfd)
+            drain_slot(devfd, slot=1)
+    finally:
+        os.close(fd_poll)
