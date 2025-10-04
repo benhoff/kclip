@@ -15,7 +15,7 @@ if [ ! -f VERSION ]; then
 fi
 
 # Read version from VERSION file
-CENTRAL_VERSION=$(cat VERSION)
+CENTRAL_VERSION=$(tr -d '\n' < VERSION)
 echo "Central VERSION: $CENTRAL_VERSION"
 
 # Check if dkms.conf exists
@@ -23,8 +23,8 @@ if [ ! -f dkms.conf ]; then
     error "dkms.conf file not found."
 fi
 
-# Read version from dkms.conf
-DKMS_VERSION=$(grep "^PACKAGE_VERSION" dkms.conf | cut -d'=' -f2 | tr -d '"')
+# Read version from dkms.conf (evaluates command substitution if present)
+DKMS_VERSION=$( ( source dkms.conf >/dev/null 2>&1; printf '%s' "$PACKAGE_VERSION" ) )
 echo "dkms.conf PACKAGE_VERSION: $DKMS_VERSION"
 
 # Check if bootstrap.sh exists
@@ -32,8 +32,17 @@ if [ ! -f bootstrap.sh ]; then
     error "bootstrap.sh file not found."
 fi
 
-# Read version from bootstrap.sh
-BOOTSTRAP_VERSION=$(grep "MODULE_VERSION=" bootstrap.sh | cut -d'=' -f2 | tr -d '"')
+# Extract dynamic MODULE_VERSION assignment from bootstrap.sh
+BOOTSTRAP_ASSIGN=$(grep -E '^[[:space:]]*MODULE_VERSION=\$\(' bootstrap.sh | head -n1)
+if [ -z "$BOOTSTRAP_ASSIGN" ]; then
+    error "Could not locate MODULE_VERSION assignment in bootstrap.sh"
+fi
+
+# Strip identifier prefix
+BOOTSTRAP_ASSIGN=${BOOTSTRAP_ASSIGN#*=}
+
+# Evaluate assignment in the current tree (expects checkout_dir to point at repo root)
+BOOTSTRAP_VERSION=$(bash -c "checkout_dir='.'; echo $BOOTSTRAP_ASSIGN" | tr -d '\n')
 echo "bootstrap.sh VERSION: $BOOTSTRAP_VERSION"
 
 # Compare versions
@@ -47,4 +56,3 @@ fi
 
 echo "Version consistency check passed."
 exit 0
-

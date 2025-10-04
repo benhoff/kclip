@@ -3,6 +3,10 @@
 # Exit immediately if a command exits with a non-zero status
 set -e
 
+MODULE_NAME="kclip"
+MODULE_VERSION=""
+PROJECT_DIR=""
+
 # Function to print error messages
 error() {
     echo "Error: $1" >&2
@@ -90,25 +94,30 @@ install_dependencies() {
 
 # Download the GitHub project
 download_project() {
-    GITHUB_REPO="https://github.com/benhoff/dev_clipboard.git" # Replace with the actual GitHub repository URL
-    MODULE_NAME="clipboard"       # Replace with the actual module name
-    MODULE_VERSION="3.10"
+    local github_repo="https://github.com/benhoff/kclip.git"
 
     TEMP_DIR=$(mktemp -d)
+    local checkout_dir="$TEMP_DIR/${MODULE_NAME}"
+
     echo "Downloading the project from GitHub..."
 
     if command_exists git; then
-        git clone --branch "v${MODULE_VERSION}" "$GITHUB_REPO" "$TEMP_DIR/${MODULE_NAME}-${MODULE_VERSION}" || {
-            echo "Tag v${MODULE_VERSION} not found. Cloning default branch."
-            git clone "$GITHUB_REPO" "$TEMP_DIR/${MODULE_NAME}-${MODULE_VERSION}"
-        }
+        git clone "$github_repo" "$checkout_dir"
     else
         echo "git not found. Attempting to download via curl..."
-        # Assuming the repo provides a tarball; adjust the URL as needed
-        curl -L "$GITHUB_REPO/archive/refs/tags/v${MODULE_VERSION}.tar.gz" | tar -xz -C "$TEMP_DIR" --strip-components=1
+        curl -L "${github_repo%.git}/archive/refs/heads/master.tar.gz" | tar -xz -C "$TEMP_DIR"
+        checkout_dir="$TEMP_DIR/$(ls "$TEMP_DIR" | head -n1)"
     fi
 
-    echo "Project downloaded to $TEMP_DIR/${MODULE_NAME}-${MODULE_VERSION}"
+    if [ -f "$checkout_dir/VERSION" ]; then
+        MODULE_VERSION=$(tr -d '\n' < "$checkout_dir/VERSION")
+    else
+        MODULE_VERSION="0.0.0"
+    fi
+
+    PROJECT_DIR="$checkout_dir"
+
+    echo "Project downloaded to $PROJECT_DIR (version ${MODULE_VERSION})"
 }
 
 # Compare two version strings
@@ -151,7 +160,7 @@ setup_dkms() {
     DEST_DIR="/usr/src/${MODULE_NAME}-${MODULE_VERSION}"
 
     echo "Copying project to $DEST_DIR..."
-    sudo cp -r "$TEMP_DIR/${MODULE_NAME}-${MODULE_VERSION}" "$DEST_DIR" || {
+    sudo cp -r "$PROJECT_DIR" "$DEST_DIR" || {
         error "Failed to copy project to $DEST_DIR"
     }
 
@@ -215,4 +224,3 @@ main() {
 
 # Execute the main function
 main
-
