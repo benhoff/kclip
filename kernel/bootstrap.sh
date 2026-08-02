@@ -1,11 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Exit immediately if a command exits with a non-zero status
-set -e
+set -euo pipefail
 
 MODULE_NAME="kclip"
 MODULE_VERSION=""
 PROJECT_DIR=""
+TEMP_DIR=""
+KCLIP_GIT_REF="${KCLIP_GIT_REF:-shmem-clipboard}"
 
 # Function to print error messages
 error() {
@@ -94,7 +96,7 @@ install_dependencies() {
 
 # Download the GitHub project
 download_project() {
-    local github_repo="https://github.com/benhoff/kclip.git"
+    local github_repo="https://github.com/benhoff/dev_clipboard.git"
 
     TEMP_DIR=$(mktemp -d)
     local checkout_dir="$TEMP_DIR/${MODULE_NAME}"
@@ -102,20 +104,21 @@ download_project() {
     echo "Downloading the project from GitHub..."
 
     if command_exists git; then
-        git clone "$github_repo" "$checkout_dir"
+        git clone --depth 1 --branch "$KCLIP_GIT_REF" "$github_repo" "$checkout_dir"
     else
         echo "git not found. Attempting to download via curl..."
-        curl -L "${github_repo%.git}/archive/refs/heads/master.tar.gz" | tar -xz -C "$TEMP_DIR"
-        checkout_dir="$TEMP_DIR/$(ls "$TEMP_DIR" | head -n1)"
+        mkdir -p "$checkout_dir"
+        curl -fsSL "${github_repo%.git}/archive/${KCLIP_GIT_REF}.tar.gz" \
+            | tar -xz --strip-components=1 -C "$checkout_dir"
     fi
 
-    if [ -f "$checkout_dir/VERSION" ]; then
-        MODULE_VERSION=$(tr -d '\n' < "$checkout_dir/VERSION")
+    PROJECT_DIR="$checkout_dir/kernel"
+
+    if [ -f "$PROJECT_DIR/VERSION" ]; then
+        MODULE_VERSION=$(tr -d '\n' < "$PROJECT_DIR/VERSION")
     else
-        MODULE_VERSION="0.0.0"
+        error "VERSION not found in the downloaded kernel component"
     fi
-
-    PROJECT_DIR="$checkout_dir"
 
     echo "Project downloaded to $PROJECT_DIR (version ${MODULE_VERSION})"
 }
@@ -207,7 +210,9 @@ configure_startup() {
 # Cleanup temporary files
 cleanup() {
     echo "Cleaning up temporary files..."
-    rm -rf "$TEMP_DIR"
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        rm -rf -- "$TEMP_DIR"
+    fi
 }
 
 # Main execution flow

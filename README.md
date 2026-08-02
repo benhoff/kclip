@@ -1,123 +1,155 @@
-## Dev Clipboard Kernel Module
+# kclip
 
-Dev Clipboard is a Linux kernel module that provides a per-user clipboard device. It allows each user to have their own isolated clipboard buffer, ensuring that one user's clipboard data is inaccessible to others.
+`kclip` is an offline-first command-line clipboard for Linux. The supported
+Phase 1 implementation consists of a Rust CLI and a local per-user daemon. It
+works without a graphical session and performs no network access.
 
-- Per-User Isolation: Each user has a separate clipboard buffer identified by their UID.
-- Efficient Data Management: Utilizes a hash table with per-bucket mutexes for fast and concurrent access.
-- Dynamic Buffer Management: Automatically resizes clipboard buffers up to a configurable maximum capacity.
-- IOCTL Interface: Provides an IOCTL command to clear the clipboard buffer from user space.
+```text
+kclip CLI -> length-prefixed CBOR -> Unix socket -> kclipd -> SQLite + blobs
+```
 
-#### Usage
+The previous kernel prototype remains isolated under `kernel/`; it is not used
+by the Rust implementation and is not built by default.
 
-A device file /dev/clipboard is created, allowing user-space applications to interact with the clipboard.
+## Build and run
 
-To read data from your clipboard:
-
-`cat /dev/clipboard`
-
-To write data to your clipboard:
-
-`echo "Your clipboard text" > /dev/clipboard`
-
-This command writes the specified text to your clipboard buffer.
-
-#### Installation
-
-Option 1: Automated Installation via Bootstrap Script
-
-You can use the provided bootstrap script. This script automates the process of installing dependencies, setting up DKMS, downloading the project, building and installing the module, and configuring it to load on startup.
+Rust 1.88 or newer is required.
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/benhoff/dev_clipboard/refs/heads/master/bootstrap.sh | bash
+make
+make test
 
-# Alternatively, using wget:
-wget -qO- https://raw.githubusercontent.com/benhoff/dev_clipboard/refs/heads/master/bootstrap.sh | bash
+# Terminal 1 (XDG_RUNTIME_DIR must be set)
+cargo run -p kclip-daemon --bin kclipd
+
+# Terminal 2
+printf 'hello' | cargo run -q -p kclip-cli --bin kclip -- copy
+cargo run -q -p kclip-cli --bin kclip -- paste
 ```
 
-Option 2: Manual installation
+The second command writes exactly `hello`; paste never adds a newline.
 
-Pre-reqs include:
-- Linux Kernel Headers: Ensure that the kernel headers matching your current kernel version are installed.
-- Build Essentials: make, gcc, and other development tools.
-- Root Privileges: Installing and loading kernel modules require root access.
-- (optional) DKMS
-  
-```bash
-# Arch Linux
-sudo pacman -Syu linux-headers
-
-# Fedora
-sudo dnf install kernel-headers kernel-devel
-
-# Debian/Ubuntu
-sudo apt-get update
-sudo apt-get install linux-headers-$(uname -r)
-
-# Optionally, install DKMS
-# Arch
-sudo pacman -Syu dkms
-
-# Fedora
-sudo dnf install dkms
-
-# Debian/Ubuntu
-sudo apt-get install dkms
-
-```
-
-1. Clone the Repository
+For the lowest-interaction installation, run:
 
 ```bash
-git clone https://github.com/benhoff/dev_clipboard.git
-cd dev_clipboard
+./install.sh
 ```
 
-2. Build the Module using make or DKMS
+Run it as your normal user, not through `sudo`; the script prompts for
+administrator authentication itself only if it needs to update system binaries.
 
-Either use the provided Makefile to compile the kernel module.
+The installer builds the release, installs `kclip` and `kclipd` under
+`/usr/local/bin`, creates or updates the current user's configuration, installs
+the systemd user service, and starts it. It requests administrator credentials
+only when the binaries actually need to be written. Running it again performs
+an update. Existing configuration values and custom slots are preserved; newly
+introduced defaults are merged, and the pre-migration file is retained as a
+timestamped backup.
 
+Useful non-interactive overrides:
+
+```bash
+./install.sh --user             # use ~/.local/bin without sudo
+./install.sh --prefix /opt/kclip # use a custom installation prefix
+./install.sh --no-start         # install without starting the service
 ```
-cd src && make && make install
+
+If `sudo` is unavailable, the default installation automatically falls back to
+`~/.local`. `make install` remains available and installs below the Makefile's
+`PREFIX`, which defaults to `~/.local`.
+
+## Phase 1 commands
+
+```bash
+kclip copy [--slot NAME] [--file PATH] [--content-type TYPE]
+kclip paste [--slot NAME] [--file PATH]
+kclip list
+kclip clear [--slot NAME]
 ```
 
--Or- use DKMS
-```
-# Add the module to DKMS
-sudo dkms add -m clipboard -v 3.0
+Global options:
 
-# Build the module using DKMS
-sudo dkms build -m clipboard -v 3.0
-
-# Install the module using DKMS
-sudo dkms install -m clipboard -v 3.0
+```text
+--socket PATH   Override $XDG_RUNTIME_DIR/kclip/kclipd.sock
+--json          Emit JSON for copy, list, clear, and paste used with --file
 ```
 
-Load the clipboard module into the kernel.
+Examples:
 
-`sudo modprobe clipboard`
+```bash
+kclip copy < archive.tar
+kclip paste > archive-copy.tar
+kclip copy --slot build-log --file build.log
+kclip paste --slot build-log --file restored.log
+kclip list
+kclip clear --slot build-log
+```
 
+Copy has no success output by default. Paste to stdout always returns raw stored
+bytes. `paste --json` therefore requires `--file`, ensuring JSON formatting can
+never corrupt piped clipboard data.
 
+## Storage and durability
 
-Clearing the Clipboard
+Defaults follow the XDG base-directory specification:
 
-To clear your clipboard buffer, use the provided IOCTL command.
+- Socket: `$XDG_RUNTIME_DIR/kclip/kclipd.sock`
+- Database: `$XDG_DATA_HOME/kclip/kclip.db`, falling back to
+  `~/.local/share/kclip/kclip.db`
+- Blobs: `$XDG_DATA_HOME/kclip/blobs`
+- Configuration: `$XDG_CONFIG_HOME/kclip/config.toml`, falling back to
+  `~/.config/kclip/config.toml`
 
-Need more Maximum Capacity per User?
+The daemon refuses to use an implicit socket when `XDG_RUNTIME_DIR` is missing.
+Its runtime directory must be owned by the current user and inaccessible to
+other users. Socket clients are authenticated with Linux peer credentials.
 
-Symptoms:
+SQLite runs with WAL, foreign keys, and `synchronous=FULL`. Every content blob is
+named by its SHA-256 digest, written to a private temporary file, flushed, and
+atomically renamed before the revision transaction commits. Identical content is
+deduplicated. The default maximum value is 10 MiB and can be changed in the
+configuration; see [`config/kclip.toml.example`](config/kclip.toml.example).
 
-Write operations fail with -ENOMEM.
-Clipboard cannot be resized further.
+## JSON schema
 
-Solution:
+`copy` and `clear` return one revision metadata object. `list` returns an array of
+the same objects. These fields are stable for protocol version 1:
 
-The module enforces a maximum clipboard capacity (MAX_CLIPBOARD_CAPACITY). To increase this limit, modify the clipboard.h file and recompile the module.
+```json
+{
+  "revision_id": "device-…:1",
+  "slot": "default",
+  "origin_device_id": "device-…",
+  "origin_sequence": 1,
+  "hlc_physical": 0,
+  "hlc_logical": 0,
+  "content_hash": "sha256-hex-or-null",
+  "content_size": 5,
+  "content_type": "text/plain; charset=utf-8",
+  "created_at": 0,
+  "expires_at": null,
+  "is_deleted": false,
+  "is_local_only": false,
+  "source_adapter": "cli",
+  "synchronization_state": "local"
+}
+```
 
-#define MAX_CLIPBOARD_CAPACITY (10 * 1024 * 1024) // 10 MB
+Times are Unix milliseconds. Human-readable `list` output is tab-separated and
+contains slot, revision, size, content type, origin device, update time,
+expiration, and synchronization state.
 
-After making changes, rebuild and reinstall the module.
+## Workspace
 
-#### Contributing
+- `crates/kclip-cli` — argument parsing, stdin/file handling, and IPC client
+- `crates/kclip-daemon` — secure Unix listener and concurrent request dispatch
+- `crates/kclip-protocol` — versioned CBOR messages and structured errors
+- `crates/kclip-storage` — SQLite revisions and content-addressed blobs
+- `crates/kclip-config` — XDG paths and validated TOML configuration
+- `packaging/systemd` — hardened headless user service
+- `kernel` — unsupported experimental kernel prototype
 
-Contributions are welcome! If you encounter issues or have suggestions for improvements, feel free to open an issue or submit a pull request.
-License
+Synchronization, encryption, pairing, history/TTL, watch subscriptions, and KDE
+Plasma integration are deliberately outside Phase 1. The revision schema already
+contains device sequence and hybrid logical-clock fields so those phases can
+extend the local store without replacing it.

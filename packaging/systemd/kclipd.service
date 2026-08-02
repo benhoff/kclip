@@ -1,0 +1,23 @@
+[Unit]
+Description=kclip local clipboard daemon
+Documentation=https://github.com/benhoff/dev_clipboard
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kclipd
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+RuntimeDirectory=kclip
+RuntimeDirectoryMode=0700
+
+# Phase 1 is local-only. This also prevents accidental network use.
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=default.target

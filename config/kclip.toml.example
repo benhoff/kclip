@@ -1,0 +1,38 @@
+# All fields are optional. These are the Phase 1 defaults.
+
+[daemon]
+# socket_path = "/run/user/1000/kclip/kclipd.sock"
+max_content_size = 10485760
+history_limit = 10
+history_max_age = "24h"
+tombstone_retention = "30d"
+
+[storage]
+# database_path = "/home/example/.local/share/kclip/kclip.db"
+# blob_directory = "/home/example/.local/share/kclip/blobs"
+
+# These sections reserve the later-phase configuration schema. Enabling either
+# integration is rejected with an actionable error by the Phase 1 daemon.
+[plasma]
+enabled = false
+mirror_slot = "default"
+desktop_to_slot = false
+slot_to_desktop = true
+text_only = true
+
+[sync]
+enabled = false
+# relay_url = "wss://relay.example.invalid/kclip"
+# reconnect_min_delay = "1s"
+# reconnect_max_delay = "5m"
+# device_name = "workstation"
+
+[security]
+require_encrypted_sync = true
+# identity_path = "/home/example/.local/share/kclip/identity"
+
+[slots.default]
+sync = true
+history_limit = 10
+history_max_age = "24h"
+plasma_mirror = true

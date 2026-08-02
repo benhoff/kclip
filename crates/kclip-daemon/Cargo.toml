@@ -1,0 +1,29 @@
+[package]
+name = "kclip-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "kclip_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kclipd"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+kclip-config = { path = "../kclip-config" }
+kclip-protocol = { path = "../kclip-protocol" }
+kclip-storage = { path = "../kclip-storage" }
+libc.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_cbor.workspace = true
+tempfile.workspace = true

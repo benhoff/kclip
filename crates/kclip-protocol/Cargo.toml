@@ -1,0 +1,13 @@
+[package]
+name = "kclip-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_bytes.workspace = true
+serde_cbor.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
