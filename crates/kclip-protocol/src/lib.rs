@@ -33,6 +33,8 @@ pub enum Operation {
         #[serde(with = "serde_bytes")]
         content: Vec<u8>,
         content_type: Option<String>,
+        #[serde(default)]
+        local: bool,
     },
     Paste {
         slot: String,
@@ -40,6 +42,8 @@ pub enum Operation {
     List,
     Clear {
         slot: String,
+        #[serde(default)]
+        local: bool,
     },
     Status,
 }
@@ -129,6 +133,28 @@ pub struct DaemonStatus {
     pub schema_version: u32,
     pub device_id: String,
     pub synchronization_enabled: bool,
+    #[serde(default)]
+    pub synchronization_configured: bool,
+    #[serde(default)]
+    pub synchronization_state: String,
+    #[serde(default)]
+    pub authenticated: bool,
+    #[serde(default)]
+    pub credential_error: bool,
+    #[serde(default)]
+    pub pending_outbox_count: u64,
+    #[serde(default)]
+    pub oldest_pending_age_millis: Option<u64>,
+    #[serde(default)]
+    pub last_successful_connection: Option<i64>,
+    #[serde(default)]
+    pub last_acknowledgement: Option<i64>,
+    #[serde(default)]
+    pub processed_server_cursor: u64,
+    #[serde(default)]
+    pub last_sync_error_category: Option<String>,
+    #[serde(default)]
+    pub quarantined_event_count: u64,
     pub plasma_enabled: bool,
 }
 

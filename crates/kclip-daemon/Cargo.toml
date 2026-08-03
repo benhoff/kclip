@@ -18,6 +18,7 @@ clap.workspace = true
 kclip-config = { path = "../kclip-config" }
 kclip-protocol = { path = "../kclip-protocol" }
 kclip-storage = { path = "../kclip-storage" }
+kclip-sync = { path = "../kclip-sync" }
 libc.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

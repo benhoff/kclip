@@ -1,11 +1,16 @@
 # kclip
 
-`kclip` is an offline-first command-line clipboard for Linux. The supported
-Phase 1 implementation consists of a Rust CLI and a local per-user daemon. It
-works without a graphical session and performs no network access.
+`kclip` is an offline-first command-line clipboard for Linux. A Rust CLI talks
+only to a local per-user daemon. The daemon optionally synchronizes encrypted
+revisions through PyPasteServer, while local commands continue to work without
+a graphical session, account, server, or network connection.
 
 ```text
 kclip CLI -> length-prefixed CBOR -> Unix socket -> kclipd -> SQLite + blobs
+                                                    |
+                                             encrypted outbox
+                                                    |
+                                      PyPasteServer /sync/v1
 ```
 
 The previous kernel prototype remains isolated under `kernel/`; it is not used
@@ -58,13 +63,17 @@ If `sudo` is unavailable, the default installation automatically falls back to
 `~/.local`. `make install` remains available and installs below the Makefile's
 `PREFIX`, which defaults to `~/.local`.
 
-## Phase 1 commands
+## Commands
 
 ```bash
-kclip copy [--slot NAME] [--file PATH] [--content-type TYPE]
+kclip copy [--slot NAME] [--file PATH] [--content-type TYPE] [--local]
 kclip paste [--slot NAME] [--file PATH]
 kclip list
-kclip clear [--slot NAME]
+kclip clear [--slot NAME] [--local]
+kclip status
+kclip auth register|login|logout|status
+kclip key generate|import|export
+kclip migrate-legacy
 ```
 
 Global options:
@@ -89,6 +98,45 @@ Copy has no success output by default. Paste to stdout always returns raw stored
 bytes. `paste --json` therefore requires `--file`, ensuring JSON formatting can
 never corrupt piped clipboard data.
 
+## Encrypted synchronization
+
+Synchronization is opt-in. Configure `[sync]` in
+[`config/kclip.toml.example`](config/kclip.toml.example), then create or import
+the account key and authenticate:
+
+```bash
+kclip key generate                 # new account only
+kclip key import                   # existing account: hidden 24-word mnemonic
+kclip auth register                # or: kclip auth login
+systemctl --user restart kclipd
+kclip status
+```
+
+Use `kclip copy --local` for values that must never enter the durable outbox.
+`[slots.NAME] sync = false` enforces the same policy for a whole slot. A normal
+copy succeeds after the local SQLite transaction commits; it never waits for
+the relay. The outbox retries with the same message ID after daemon, network,
+or server restarts.
+
+The relay receives routing identifiers and XChaCha20-Poly1305 ciphertext only.
+Slot names, content types, hashes, bytes, tombstones, and revision clocks are
+inside a canonical-CBOR encrypted envelope. Production configuration requires
+`wss://` with platform certificate validation. `ws://` is accepted only with
+the explicit development-only `allow_insecure_transport = true` setting.
+
+Existing PyPasteServer Python credentials can be copied safely into kclip-owned
+paths without printing them:
+
+```bash
+kclip migrate-legacy
+```
+
+This validates both `~/.config/clipboard_app/token.json` and
+`~/.config/clipboard_app/key`, then writes private copies under the kclip XDG
+directories. The Python daemon can be disabled after bidirectional sync has
+been verified. `kclip key export --show` is the only command that prints key
+recovery material and emits an explicit warning.
+
 ## Storage and durability
 
 Defaults follow the XDG base-directory specification:
@@ -99,6 +147,8 @@ Defaults follow the XDG base-directory specification:
 - Blobs: `$XDG_DATA_HOME/kclip/blobs`
 - Configuration: `$XDG_CONFIG_HOME/kclip/config.toml`, falling back to
   `~/.config/kclip/config.toml`
+- Access token: `$XDG_CONFIG_HOME/kclip/token.json`
+- Account sync key: `$XDG_DATA_HOME/kclip/sync.key`
 
 The daemon refuses to use an implicit socket when `XDG_RUNTIME_DIR` is missing.
 Its runtime directory must be owned by the current user and inaccessible to
@@ -146,10 +196,11 @@ expiration, and synchronization state.
 - `crates/kclip-protocol` — versioned CBOR messages and structured errors
 - `crates/kclip-storage` — SQLite revisions and content-addressed blobs
 - `crates/kclip-config` — XDG paths and validated TOML configuration
+- `crates/kclip-crypto` — canonical CBOR and XChaCha20-Poly1305 envelopes
+- `crates/kclip-sync` — durable WebSocket replay, inbox, outbox, and account API
 - `packaging/systemd` — hardened headless user service
 - `kernel` — unsupported experimental kernel prototype
 
-Synchronization, encryption, pairing, history/TTL, watch subscriptions, and KDE
-Plasma integration are deliberately outside Phase 1. The revision schema already
-contains device sequence and hybrid logical-clock fields so those phases can
-extend the local store without replacing it.
+Pairing/key rotation, history/TTL commands, watch subscriptions, and KDE Plasma
+integration remain later phases. Protocol version 1 deliberately uses one
+shared 32-byte account key and retains every accepted relay event.

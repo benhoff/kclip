@@ -76,6 +76,8 @@ async fn main() {
             database_path: resolved.database_path,
             blob_directory: resolved.blob_directory,
             max_content_size: resolved.max_content_size,
+            sync: resolved.sync,
+            slots: resolved.slots,
         };
         run_until(server, async {
             if let Err(error) = tokio::signal::ctrl_c().await {

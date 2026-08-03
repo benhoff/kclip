@@ -1,9 +1,12 @@
+use kclip_config::{SlotConfig, SyncResolution};
 use kclip_protocol::{
     DaemonStatus, ErrorCode, FrameError, Operation, PROTOCOL_VERSION, ProtocolError, Request,
     Response, ResponsePayload, read_frame_with_limit, write_frame,
 };
-use kclip_storage::{Storage, StorageError};
+use kclip_storage::{MutationOptions, Storage, StorageError};
+use kclip_sync::{RuntimeStatus, WorkerControl, start_worker};
 use std::{
+    collections::BTreeMap,
     fs,
     future::Future,
     io,
@@ -27,6 +30,29 @@ pub struct ServerConfig {
     pub database_path: PathBuf,
     pub blob_directory: PathBuf,
     pub max_content_size: u64,
+    pub sync: SyncResolution,
+    pub slots: BTreeMap<String, SlotConfig>,
+}
+
+struct DaemonState {
+    storage: Arc<Storage>,
+    sync_worker: Option<WorkerControl>,
+    synchronization_configured: bool,
+    synchronization_enabled: bool,
+    sync_configuration_error: bool,
+    slots: BTreeMap<String, SlotConfig>,
+}
+
+impl DaemonState {
+    fn should_sync(&self, slot: &str, local: bool) -> bool {
+        !local
+            && self.synchronization_enabled
+            && self
+                .slots
+                .get(slot)
+                .and_then(|configuration| configuration.sync)
+                .unwrap_or(true)
+    }
 }
 
 pub async fn run_until<F>(config: ServerConfig, shutdown: F) -> Result<(), DaemonError>
@@ -47,6 +73,36 @@ where
         config.max_content_size,
     )?);
     let (listener, socket_guard) = bind_socket(&config.socket_path).await?;
+    let (
+        sync_worker,
+        synchronization_configured,
+        synchronization_enabled,
+        sync_configuration_error,
+    ) = match config.sync {
+        SyncResolution::Disabled => (None, false, false, false),
+        SyncResolution::Invalid(error) => {
+            warn!(category = "invalid_configuration", error = %error, "synchronization is disabled");
+            (None, true, false, true)
+        }
+        SyncResolution::Ready(configuration) => (
+            Some(start_worker(
+                Arc::clone(&storage),
+                configuration,
+                config.max_content_size,
+            )),
+            true,
+            true,
+            false,
+        ),
+    };
+    let state = Arc::new(DaemonState {
+        storage,
+        sync_worker,
+        synchronization_configured,
+        synchronization_enabled,
+        sync_configuration_error,
+        slots: config.slots,
+    });
     let current_uid = unsafe { libc::geteuid() };
     let maximum_request_frame = usize::try_from(config.max_content_size)
         .unwrap_or(usize::MAX)
@@ -93,14 +149,14 @@ where
                     continue;
                 }
 
-                let storage = Arc::clone(&storage);
+                let state = Arc::clone(&state);
                 let concurrency = Arc::clone(&concurrency);
                 clients.spawn(async move {
                     let permit = concurrency.acquire_owned().await;
                     if permit.is_err() {
                         return;
                     }
-                    if let Err(source) = handle_client(stream, storage, maximum_request_frame).await {
+                    if let Err(source) = handle_client(stream, state, maximum_request_frame).await {
                         debug!(error = %source, "local client disconnected with an error");
                     }
                 });
@@ -109,10 +165,18 @@ where
     }
 
     drop(listener);
+    if let Some(worker) = &state.sync_worker {
+        worker.shutdown();
+    }
     while let Some(result) = clients.join_next().await {
         if let Err(join_error) = result {
             error!(error = %join_error, "client task failed during shutdown");
         }
+    }
+    if let Some(worker) = &state.sync_worker
+        && !worker.wait_stopped(std::time::Duration::from_secs(2)).await
+    {
+        warn!("synchronization worker did not stop before shutdown deadline");
     }
     drop(socket_guard);
     info!("kclipd stopped");
@@ -121,7 +185,7 @@ where
 
 async fn handle_client(
     mut stream: UnixStream,
-    storage: Arc<Storage>,
+    state: Arc<DaemonState>,
     maximum_request_frame: usize,
 ) -> Result<(), ClientError> {
     let request: Request = match read_frame_with_limit(&mut stream, maximum_request_frame).await {
@@ -161,9 +225,22 @@ async fn handle_client(
 
     let request_id = request.request_id;
     let operation = request.operation;
-    let result = tokio::task::spawn_blocking(move || process_operation(&storage, operation))
-        .await
-        .map_err(ClientError::Task)?;
+    let wakes_sync = matches!(&operation, Operation::Copy { .. } | Operation::Clear { .. });
+    let runtime_status = match &state.sync_worker {
+        Some(worker) => worker.status().await,
+        None => RuntimeStatus::default(),
+    };
+    let worker = state.sync_worker.clone();
+    let result =
+        tokio::task::spawn_blocking(move || process_operation(&state, operation, runtime_status))
+            .await
+            .map_err(ClientError::Task)?;
+    if result.is_ok()
+        && wakes_sync
+        && let Some(worker) = worker
+    {
+        worker.wake();
+    }
     let response = match result {
         Ok(payload) => Response::success(request_id, payload),
         Err(error) => Response::error(request_id, error.for_operation(operation_name)),
@@ -173,16 +250,28 @@ async fn handle_client(
 }
 
 fn process_operation(
-    storage: &Storage,
+    state: &DaemonState,
     operation: Operation,
+    runtime_status: RuntimeStatus,
 ) -> Result<ResponsePayload, ProtocolError> {
+    let storage = &state.storage;
     match operation {
         Operation::Copy {
             slot,
             content,
             content_type,
+            local,
         } => storage
-            .copy(&slot, &content, content_type.as_deref())
+            .copy_with_options(
+                &slot,
+                &content,
+                content_type.as_deref(),
+                MutationOptions {
+                    source_adapter: "cli".into(),
+                    local_only: local,
+                    enqueue_sync: state.should_sync(&slot, local),
+                },
+            )
             .map(ResponsePayload::Stored)
             .map_err(storage_error),
         Operation::Paste { slot } => storage
@@ -193,18 +282,49 @@ fn process_operation(
             .list()
             .map(ResponsePayload::Slots)
             .map_err(storage_error),
-        Operation::Clear { slot } => storage
-            .clear(&slot)
+        Operation::Clear { slot, local } => storage
+            .clear_with_options(
+                &slot,
+                MutationOptions {
+                    source_adapter: "cli".into(),
+                    local_only: local,
+                    enqueue_sync: state.should_sync(&slot, local),
+                },
+            )
             .map(ResponsePayload::Cleared)
             .map_err(storage_error),
-        Operation::Status => Ok(ResponsePayload::Status(DaemonStatus {
-            daemon_available: true,
-            daemon_version: DAEMON_VERSION.into(),
-            schema_version: storage.schema_version(),
-            device_id: storage.device_id().map_err(storage_error)?,
-            synchronization_enabled: false,
-            plasma_enabled: false,
-        })),
+        Operation::Status => {
+            let sync = storage.sync_status().map_err(storage_error)?;
+            Ok(ResponsePayload::Status(DaemonStatus {
+                daemon_available: true,
+                daemon_version: DAEMON_VERSION.into(),
+                schema_version: storage.schema_version(),
+                device_id: storage.device_id().map_err(storage_error)?,
+                synchronization_enabled: state.synchronization_enabled,
+                synchronization_configured: state.synchronization_configured,
+                synchronization_state: if state.sync_configuration_error {
+                    "invalid_configuration".into()
+                } else if state.synchronization_enabled {
+                    runtime_status.state
+                } else {
+                    "disabled".into()
+                },
+                authenticated: runtime_status.authenticated,
+                credential_error: runtime_status.credential_error || state.sync_configuration_error,
+                pending_outbox_count: sync.pending_outbox_count,
+                oldest_pending_age_millis: sync.oldest_pending_age_millis,
+                last_successful_connection: runtime_status.last_successful_connection,
+                last_acknowledgement: sync.last_acknowledged_at,
+                processed_server_cursor: sync.server_cursor,
+                last_sync_error_category: runtime_status.last_error_category.or_else(|| {
+                    state
+                        .sync_configuration_error
+                        .then(|| "invalid_configuration".into())
+                }),
+                quarantined_event_count: sync.quarantined_events,
+                plasma_enabled: false,
+            }))
+        }
     }
 }
 

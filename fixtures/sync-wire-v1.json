@@ -1,0 +1,45 @@
+{
+  "hello": {
+    "type": "hello",
+    "protocol_version": 1,
+    "device_id": "device-contract",
+    "resume_after": 42
+  },
+  "ready": {
+    "type": "ready",
+    "protocol_version": 1,
+    "connection_id": "connection-contract",
+    "latest_sequence": 57,
+    "replay_from": 43
+  },
+  "push": {
+    "type": "push",
+    "protocol_version": 1,
+    "message_id": "550e8400-e29b-41d4-a716-446655440000",
+    "algorithm": "xchacha20-poly1305",
+    "nonce": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJ",
+    "ciphertext": "AA",
+    "tag": "AAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "push_ack": {
+    "type": "push_ack",
+    "message_id": "550e8400-e29b-41d4-a716-446655440000",
+    "server_sequence": 58,
+    "duplicate": false
+  },
+  "event": {
+    "type": "event",
+    "server_sequence": 58,
+    "message_id": "550e8400-e29b-41d4-a716-446655440000",
+    "sender_device_id": "device-contract",
+    "algorithm": "xchacha20-poly1305",
+    "nonce": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJ",
+    "ciphertext": "AA",
+    "tag": "AAAAAAAAAAAAAAAAAAAAAA",
+    "accepted_at": 1770000000000
+  },
+  "checkpoint": {
+    "type": "checkpoint",
+    "server_sequence": 58
+  }
+}

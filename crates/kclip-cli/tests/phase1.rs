@@ -36,8 +36,17 @@ impl TestDaemon {
         data: PathBuf,
         max_content_size: u64,
     ) -> Self {
-        let (shutdown, receiver) = oneshot::channel();
         let config = server_config(&socket, &data, max_content_size);
+        Self::start_with_server_config(temp, socket, data, config).await
+    }
+
+    async fn start_with_server_config(
+        temp: TempDir,
+        socket: PathBuf,
+        data: PathBuf,
+        config: ServerConfig,
+    ) -> Self {
+        let (shutdown, receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
             run_until(config, async {
                 let _ = receiver.await;
@@ -76,6 +85,8 @@ fn server_config(socket: &Path, data: &Path, max_content_size: u64) -> ServerCon
         database_path: data.join("kclip.db"),
         blob_directory: data.join("blobs"),
         max_content_size,
+        sync: kclip_config::SyncResolution::Disabled,
+        slots: Default::default(),
     }
 }
 
@@ -108,6 +119,7 @@ async fn copy(daemon: &TestDaemon, slot: &str, content: &[u8]) -> Result<(), Cli
             slot: slot.into(),
             file: None,
             content_type: None,
+            local: false,
         },
         content,
     )
@@ -156,9 +168,16 @@ async fn named_slots_are_independent_and_clear_is_scoped() {
     let daemon = TestDaemon::start(1024).await;
     copy(&daemon, "one", b"first").await.unwrap();
     copy(&daemon, "two", b"second").await.unwrap();
-    execute_with_input(&daemon, Command::Clear { slot: "one".into() }, &[])
-        .await
-        .unwrap();
+    execute_with_input(
+        &daemon,
+        Command::Clear {
+            slot: "one".into(),
+            local: false,
+        },
+        &[],
+    )
+    .await
+    .unwrap();
 
     assert!(
         matches!(paste(&daemon, "one").await, Err(CliError::Remote(error)) if error.code == ErrorCode::SlotNotFound)
@@ -190,6 +209,7 @@ async fn concurrent_copies_receive_distinct_revision_ids() {
             slot: "one".into(),
             content: b"1".to_vec(),
             content_type: None,
+            local: false,
         },
     );
     let second = send_request(
@@ -198,6 +218,7 @@ async fn concurrent_copies_receive_distinct_revision_ids() {
             slot: "two".into(),
             content: b"2".to_vec(),
             content_type: None,
+            local: false,
         },
     );
     let (first, second) = tokio::join!(first, second);
@@ -255,6 +276,7 @@ async fn file_copy_and_atomic_file_paste_work() {
             slot: "file".into(),
             file: Some(input_path),
             content_type: None,
+            local: false,
         },
         b"ignored stdin",
     )
@@ -279,9 +301,16 @@ async fn list_reports_only_current_live_slots() {
     let daemon = TestDaemon::start(1024).await;
     copy(&daemon, "z", b"last").await.unwrap();
     copy(&daemon, "a", b"first").await.unwrap();
-    execute_with_input(&daemon, Command::Clear { slot: "z".into() }, &[])
-        .await
-        .unwrap();
+    execute_with_input(
+        &daemon,
+        Command::Clear {
+            slot: "z".into(),
+            local: false,
+        },
+        &[],
+    )
+    .await
+    .unwrap();
     let output = execute_with_input(&daemon, Command::List, &[])
         .await
         .unwrap();
@@ -367,5 +396,70 @@ async fn compiled_cli_supports_shell_pipes_and_process_exit_codes() {
     })
     .await;
     result.unwrap();
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn offline_relay_never_blocks_local_clipboard_operations() {
+    let temp = TempDir::new().unwrap();
+    let socket = temp.path().join("runtime/kclipd.sock");
+    let data = temp.path().join("data");
+    let token_path = temp.path().join("secrets/token.json");
+    let key_path = temp.path().join("secrets/sync.key");
+    kclip_sync::write_token(&token_path, "offline-token").unwrap();
+    kclip_crypto::write_sync_key(&key_path, &[3_u8; 32]).unwrap();
+    let mut slots = std::collections::BTreeMap::new();
+    slots.insert(
+        "secret".into(),
+        kclip_config::SlotConfig {
+            sync: Some(false),
+            ..Default::default()
+        },
+    );
+    let config = ServerConfig {
+        socket_path: socket.clone(),
+        database_path: data.join("kclip.db"),
+        blob_directory: data.join("blobs"),
+        max_content_size: 1024,
+        sync: kclip_config::SyncResolution::Ready(kclip_config::ResolvedSyncConfig {
+            relay_url: "ws://127.0.0.1:1/sync/v1".into(),
+            reconnect_min_delay: Duration::from_millis(10),
+            reconnect_max_delay: Duration::from_millis(50),
+            device_name: "offline-test".into(),
+            token_path,
+            sync_key_path: key_path,
+            allow_insecure_transport: true,
+        }),
+        slots,
+    };
+    let daemon = TestDaemon::start_with_server_config(temp, socket, data, config).await;
+    copy(&daemon, "default", b"local still works")
+        .await
+        .unwrap();
+    assert_eq!(
+        paste(&daemon, "default").await.unwrap(),
+        b"local still works"
+    );
+    copy(&daemon, "secret", b"slot policy").await.unwrap();
+    execute_with_input(
+        &daemon,
+        Command::Copy {
+            slot: "one-off-private".into(),
+            file: None,
+            content_type: None,
+            local: true,
+        },
+        b"local flag",
+    )
+    .await
+    .unwrap();
+    let ResponsePayload::Status(status) = send_request(&daemon.socket, Operation::Status)
+        .await
+        .unwrap()
+    else {
+        panic!("unexpected status response")
+    };
+    assert!(status.synchronization_enabled);
+    assert_eq!(status.pending_outbox_count, 1);
     daemon.stop().await;
 }

@@ -1,4 +1,4 @@
-# All fields are optional. These are the Phase 1 defaults.
+# All fields are optional. Synchronization stays disabled until explicitly enabled.
 
 [daemon]
 # socket_path = "/run/user/1000/kclip/kclipd.sock"
@@ -11,8 +11,7 @@ tombstone_retention = "30d"
 # database_path = "/home/example/.local/share/kclip/kclip.db"
 # blob_directory = "/home/example/.local/share/kclip/blobs"
 
-# These sections reserve the later-phase configuration schema. Enabling either
-# integration is rejected with an actionable error by the Phase 1 daemon.
+# Plasma remains reserved for a later implementation.
 [plasma]
 enabled = false
 mirror_slot = "default"
@@ -22,14 +21,18 @@ text_only = true
 
 [sync]
 enabled = false
-# relay_url = "wss://relay.example.invalid/kclip"
-# reconnect_min_delay = "1s"
-# reconnect_max_delay = "5m"
-# device_name = "workstation"
+relay_url = "wss://clipboard.example.invalid/sync/v1"
+reconnect_min_delay = "1s"
+reconnect_max_delay = "5m"
+device_name = "workstation"
+# token_path = "/home/example/.config/kclip/token.json"
+# Development tests only. Production relay URLs must use wss://.
+allow_insecure_transport = false
 
 [security]
 require_encrypted_sync = true
 # identity_path = "/home/example/.local/share/kclip/identity"
+# sync_key_path = "/home/example/.local/share/kclip/sync.key"
 
 [slots.default]
 sync = true

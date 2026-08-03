@@ -1,14 +1,19 @@
 use clap::{Parser, Subcommand};
-use kclip_config::{Config, ConfigError};
+use kclip_config::{Config, ConfigError, default_sync_key_path, default_token_path};
+use kclip_crypto::{
+    atomic_write_secret, generate_sync_key, import_legacy_key, key_from_mnemonic, mnemonic_for_key,
+    read_sync_key, write_sync_key,
+};
 use kclip_protocol::{
     DEFAULT_SLOT, ErrorCode, FrameError, MAX_FRAME_SIZE, Operation, PROTOCOL_VERSION,
     ProtocolError, Request, Response, ResponsePayload, ResponseResult, RevisionMetadata,
     read_frame, write_frame,
 };
+use kclip_sync::{AuthClient, SyncError, TokenFile, read_token, remove_token, write_token};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -52,6 +57,10 @@ pub enum Command {
         /// Explicit content type; otherwise the daemon safely detects UTF-8 text.
         #[arg(long)]
         content_type: Option<String>,
+
+        /// Keep this revision on this device even when synchronization is enabled.
+        #[arg(long)]
+        local: bool,
     },
 
     /// Write a slot's exact bytes without adding a newline.
@@ -73,6 +82,72 @@ pub enum Command {
         /// Slot to clear.
         #[arg(long, default_value = DEFAULT_SLOT)]
         slot: String,
+
+        /// Create a local-only tombstone that is not uploaded.
+        #[arg(long)]
+        local: bool,
+    },
+
+    /// Show local daemon and synchronization health without exposing secrets.
+    Status,
+
+    /// Manage the PyPasteServer account token.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+
+    /// Manage the shared 32-byte account synchronization key.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+
+    /// Import the legacy Python client's token and key into kclip-owned paths.
+    MigrateLegacy {
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum AuthCommand {
+    Register {
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        email: Option<String>,
+    },
+    Login {
+        #[arg(long)]
+        username: Option<String>,
+    },
+    Logout {
+        /// Remove the local token without contacting the server.
+        #[arg(long)]
+        local: bool,
+    },
+    Status,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum KeyCommand {
+    Generate {
+        /// Replace an existing key. This disconnects the device from old ciphertext.
+        #[arg(long)]
+        force: bool,
+    },
+    Import {
+        /// File containing a raw 32-byte key. Omit to enter a 24-word mnemonic securely.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    Export {
+        /// Required acknowledgement that the recovery mnemonic will be printed.
+        #[arg(long)]
+        show: bool,
     },
 }
 
@@ -81,17 +156,14 @@ pub async fn execute(
     input: &mut dyn Read,
     output: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let socket = match &cli.socket {
-        Some(path) => path.clone(),
-        None => Config::load(None)?.resolve_socket(None)?,
-    };
-
     match &cli.command {
         Command::Copy {
             slot,
             file,
             content_type,
+            local,
         } => {
+            let socket = local_socket(cli)?;
             let content = read_copy_input(file.as_deref(), input)?;
             let response = send_request(
                 &socket,
@@ -99,6 +171,7 @@ pub async fn execute(
                     slot: slot.clone(),
                     content,
                     content_type: content_type.clone(),
+                    local: *local,
                 },
             )
             .await?;
@@ -110,6 +183,7 @@ pub async fn execute(
             }
         }
         Command::Paste { slot, file } => {
+            let socket = local_socket(cli)?;
             if cli.json && file.is_none() {
                 return Err(CliError::Remote(ProtocolError::new(
                     ErrorCode::UnsupportedOperation,
@@ -131,6 +205,7 @@ pub async fn execute(
             }
         }
         Command::List => {
+            let socket = local_socket(cli)?;
             let response = send_request(&socket, Operation::List).await?;
             let ResponsePayload::Slots(slots) = response else {
                 return Err(CliError::UnexpectedResponse);
@@ -141,8 +216,16 @@ pub async fn execute(
                 write_human_list(output, &slots)?;
             }
         }
-        Command::Clear { slot } => {
-            let response = send_request(&socket, Operation::Clear { slot: slot.clone() }).await?;
+        Command::Clear { slot, local } => {
+            let socket = local_socket(cli)?;
+            let response = send_request(
+                &socket,
+                Operation::Clear {
+                    slot: slot.clone(),
+                    local: *local,
+                },
+            )
+            .await?;
             let ResponsePayload::Cleared(metadata) = response else {
                 return Err(CliError::UnexpectedResponse);
             };
@@ -150,8 +233,329 @@ pub async fn execute(
                 write_json(output, &metadata)?;
             }
         }
+        Command::Status => {
+            let socket = local_socket(cli)?;
+            let response = send_request(&socket, Operation::Status).await?;
+            let ResponsePayload::Status(status) = response else {
+                return Err(CliError::UnexpectedResponse);
+            };
+            if cli.json {
+                write_json(output, &status)?;
+            } else {
+                writeln!(output, "daemon: available ({})", status.daemon_version)?;
+                writeln!(output, "device: {}", status.device_id)?;
+                writeln!(output, "sync: {}", status.synchronization_state)?;
+                writeln!(output, "authenticated: {}", status.authenticated)?;
+                writeln!(output, "pending outbox: {}", status.pending_outbox_count)?;
+                writeln!(output, "server cursor: {}", status.processed_server_cursor)?;
+                writeln!(
+                    output,
+                    "quarantined events: {}",
+                    status.quarantined_event_count
+                )?;
+                if let Some(category) = status.last_sync_error_category {
+                    writeln!(output, "last sync error: {category}")?;
+                }
+            }
+        }
+        Command::Auth { command } => {
+            execute_auth(command, input, output, cli.json).await?;
+        }
+        Command::Key { command } => execute_key(command, input, output, cli.json)?,
+        Command::MigrateLegacy {
+            token_file,
+            key_file,
+        } => migrate_legacy(token_file.as_deref(), key_file.as_deref(), output, cli.json)?,
     }
     Ok(())
+}
+
+fn local_socket(cli: &Cli) -> Result<PathBuf, CliError> {
+    match &cli.socket {
+        Some(path) => Ok(path.clone()),
+        None => Ok(Config::load(None)?.resolve_socket(None)?),
+    }
+}
+
+async fn execute_auth(
+    command: &AuthCommand,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    json: bool,
+) -> Result<(), CliError> {
+    let config = Config::load(None)?;
+    let token_path = config
+        .sync
+        .token_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_token_path)?;
+    match command {
+        AuthCommand::Status => {
+            let state = match read_token(&token_path) {
+                Ok(_) => "present",
+                Err(_) if token_path.exists() => "invalid_or_unsafe",
+                Err(_) => "missing",
+            };
+            if json {
+                write_json(
+                    output,
+                    &serde_json::json!({
+                        "token_present": state == "present",
+                        "state": state
+                    }),
+                )?;
+            } else {
+                writeln!(output, "token: {state}")?;
+            }
+        }
+        AuthCommand::Register { username, email } => {
+            let relay = configured_relay(&config)?;
+            let username = prompt_value(username.as_deref(), "Username", input, output)?;
+            let email = prompt_value(email.as_deref(), "Email", input, output)?;
+            let password = rpassword::prompt_password("Password: ")?;
+            let confirmation = rpassword::prompt_password("Confirm password: ")?;
+            if password.is_empty() || password != confirmation {
+                return Err(CliError::Usage(
+                    "passwords are empty or do not match".into(),
+                ));
+            }
+            AuthClient::from_relay(relay, token_path)?
+                .register(&username, &email, &password)
+                .await?;
+            write_success(output, json, "registered")?;
+        }
+        AuthCommand::Login { username } => {
+            let relay = configured_relay(&config)?;
+            let username = prompt_value(username.as_deref(), "Username", input, output)?;
+            let password = rpassword::prompt_password("Password: ")?;
+            if password.is_empty() {
+                return Err(CliError::Usage("password must not be empty".into()));
+            }
+            AuthClient::from_relay(relay, token_path)?
+                .login(&username, &password)
+                .await?;
+            write_success(output, json, "logged_in")?;
+        }
+        AuthCommand::Logout { local } => {
+            if *local {
+                remove_token(&token_path)?;
+            } else {
+                let relay = configured_relay(&config)?;
+                AuthClient::from_relay(relay, token_path)?.logout().await?;
+            }
+            write_success(output, json, "logged_out")?;
+        }
+    }
+    Ok(())
+}
+
+fn execute_key(
+    command: &KeyCommand,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    json: bool,
+) -> Result<(), CliError> {
+    let config = Config::load(None)?;
+    let path = config
+        .security
+        .sync_key_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_sync_key_path)?;
+    match command {
+        KeyCommand::Generate { force } => {
+            if path.exists() && !force {
+                return Err(CliError::Usage(
+                    "a synchronization key already exists; use --force only when intentionally starting a new account key"
+                        .into(),
+                ));
+            }
+            generate_sync_key(&path).map_err(SyncError::from)?;
+            write_success(output, json, "key_generated")?;
+        }
+        KeyCommand::Import { file } => {
+            if let Some(source) = file {
+                import_legacy_key(source, &path).map_err(SyncError::from)?;
+            } else {
+                writeln!(
+                    output,
+                    "Enter the existing 24-word recovery mnemonic (input is hidden):"
+                )?;
+                let words = rpassword::read_password()?;
+                let key = key_from_mnemonic(words.trim()).map_err(SyncError::from)?;
+                write_sync_key(&path, &key).map_err(SyncError::from)?;
+            }
+            write_success(output, json, "key_imported")?;
+        }
+        KeyCommand::Export { show } => {
+            if !show {
+                return Err(CliError::Usage(
+                    "refusing to print recovery material without --show".into(),
+                ));
+            }
+            let key = read_sync_key(&path).map_err(SyncError::from)?;
+            let mnemonic = mnemonic_for_key(&key).map_err(SyncError::from)?;
+            if json {
+                write_json(output, &serde_json::json!({ "mnemonic": mnemonic }))?;
+            } else {
+                writeln!(
+                    output,
+                    "WARNING: anyone with these words can decrypt synchronized clipboard history."
+                )?;
+                writeln!(output, "{mnemonic}")?;
+            }
+        }
+    }
+    let _ = input;
+    Ok(())
+}
+
+fn migrate_legacy(
+    token_source: Option<&Path>,
+    key_source: Option<&Path>,
+    output: &mut dyn Write,
+    json: bool,
+) -> Result<(), CliError> {
+    let config = Config::load(None)?;
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or(ConfigError::MissingHomeDirectory)?;
+    let token_source = token_source
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".config/clipboard_app/token.json"));
+    let key_source = key_source
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".config/clipboard_app/key"));
+    let token_destination = config
+        .sync
+        .token_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_token_path)?;
+    let key_destination = config
+        .security
+        .sync_key_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_sync_key_path)?;
+
+    // The legacy Python client commonly created 0644 files. Validate ownership
+    // and file type, then copy into private kclip-owned destinations.
+    let token: TokenFile = serde_json::from_slice(&read_owned_legacy_file(&token_source)?)?;
+    if token.access_token.trim().is_empty() {
+        return Err(CliError::Usage("legacy access token is empty".into()));
+    }
+    let key: [u8; 32] = read_owned_legacy_file(&key_source)?
+        .try_into()
+        .map_err(|_| CliError::Usage("legacy synchronization key is not 32 bytes".into()))?;
+    // Validate both sources before mutating either destination.
+    let token_backup = backup_existing_secret(&token_destination)?;
+    let _key_backup = backup_existing_secret(&key_destination)?;
+    write_token(&token_destination, &token.access_token)?;
+    if let Err(error) = atomic_write_secret(&key_destination, &key) {
+        restore_secret(&token_destination, token_backup.as_deref())?;
+        return Err(SyncError::from(error).into());
+    }
+    write_success(output, json, "legacy_credentials_imported")
+}
+
+fn read_owned_legacy_file(path: &Path) -> Result<Vec<u8>, CliError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.len() > 64 * 1024
+    {
+        return Err(CliError::Usage(
+            "legacy secret must be a regular non-symbolic-link file owned by this user".into(),
+        ));
+    }
+    Ok(fs::read(path)?)
+}
+
+fn backup_existing_secret(path: &Path) -> Result<Option<PathBuf>, CliError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    kclip_crypto::validate_secret_file(path).map_err(SyncError::from)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| CliError::Usage("secret path has no file name".into()))?;
+    let backup = path.with_file_name(format!("{}.bak.{timestamp}", file_name.to_string_lossy()));
+    if backup.exists() {
+        return Err(CliError::Usage(format!(
+            "refusing to replace existing migration backup {}",
+            backup.display()
+        )));
+    }
+    let bytes = fs::read(path)?;
+    atomic_write_secret(&backup, &bytes).map_err(SyncError::from)?;
+    Ok(Some(backup))
+}
+
+fn restore_secret(path: &Path, backup: Option<&Path>) -> Result<(), CliError> {
+    match backup {
+        Some(backup) => {
+            let bytes = fs::read(backup)?;
+            atomic_write_secret(path, &bytes).map_err(SyncError::from)?;
+        }
+        None => match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        },
+    }
+    Ok(())
+}
+
+fn configured_relay(config: &Config) -> Result<&str, CliError> {
+    config
+        .sync
+        .relay_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CliError::Usage("sync.relay_url must be configured first".into()))
+}
+
+fn prompt_value(
+    configured: Option<&str>,
+    label: &str,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+) -> Result<String, CliError> {
+    if let Some(value) = configured.filter(|value| !value.trim().is_empty()) {
+        return Ok(value.to_owned());
+    }
+    write!(output, "{label}: ")?;
+    output.flush()?;
+    let mut bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    while input.read(&mut byte)? == 1 && byte[0] != b'\n' {
+        bytes.push(byte[0]);
+    }
+    let value = String::from_utf8(bytes)
+        .map_err(|_| CliError::Usage(format!("{label} must be valid UTF-8")))?;
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(CliError::Usage(format!("{label} must not be empty")));
+    }
+    Ok(value)
+}
+
+fn write_success(output: &mut dyn Write, json: bool, action: &str) -> Result<(), CliError> {
+    if json {
+        write_json(
+            output,
+            &serde_json::json!({ "success": true, "action": action }),
+        )
+    } else {
+        writeln!(output, "{action}").map_err(CliError::Io)
+    }
 }
 
 pub async fn send_request(
@@ -276,6 +680,10 @@ pub enum CliError {
     Config(#[from] ConfigError),
     #[error("could not encode JSON output: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("synchronization failed: {0}")]
+    Sync(#[from] SyncError),
+    #[error("invalid command usage: {0}")]
+    Usage(String),
 }
 
 impl CliError {
@@ -284,6 +692,9 @@ impl CliError {
             Self::DaemonUnavailable(_) => 3,
             Self::Remote(error) => error.code.exit_code(),
             Self::Config(_) => 2,
+            Self::Usage(_) => 2,
+            Self::Sync(SyncError::Authentication | SyncError::Credentials(_)) => 9,
+            Self::Sync(_) => 8,
             Self::Frame(FrameError::Io(source))
                 if matches!(
                     source.kind(),

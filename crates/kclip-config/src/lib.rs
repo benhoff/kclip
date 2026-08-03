@@ -8,6 +8,7 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -58,6 +59,9 @@ pub struct SyncConfig {
     pub reconnect_min_delay: Option<String>,
     pub reconnect_max_delay: Option<String>,
     pub device_name: Option<String>,
+    pub token_path: Option<PathBuf>,
+    /// Development-only escape hatch for local test relays.
+    pub allow_insecure_transport: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -65,6 +69,7 @@ pub struct SyncConfig {
 pub struct SecurityConfig {
     pub identity_path: Option<PathBuf>,
     pub require_encrypted_sync: Option<bool>,
+    pub sync_key_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -82,6 +87,26 @@ pub struct ResolvedConfig {
     pub database_path: PathBuf,
     pub blob_directory: PathBuf,
     pub max_content_size: u64,
+    pub sync: SyncResolution,
+    pub slots: BTreeMap<String, SlotConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SyncResolution {
+    Disabled,
+    Ready(ResolvedSyncConfig),
+    Invalid(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedSyncConfig {
+    pub relay_url: String,
+    pub reconnect_min_delay: Duration,
+    pub reconnect_max_delay: Duration,
+    pub device_name: String,
+    pub token_path: PathBuf,
+    pub sync_key_path: PathBuf,
+    pub allow_insecure_transport: bool,
 }
 
 impl Config {
@@ -149,6 +174,8 @@ impl Config {
             database_path,
             blob_directory,
             max_content_size,
+            sync: self.resolve_sync(),
+            slots: self.slots.clone(),
         })
     }
 
@@ -160,11 +187,6 @@ impl Config {
     }
 
     pub fn validate_phase_one(&self) -> Result<(), ConfigError> {
-        if self.sync.enabled {
-            return Err(ConfigError::Invalid(
-                "synchronization is not available in Phase 1; set sync.enabled = false".into(),
-            ));
-        }
         if self.plasma.enabled {
             return Err(ConfigError::Invalid(
                 "Plasma integration is not available in Phase 1; set plasma.enabled = false".into(),
@@ -192,6 +214,105 @@ impl Config {
         }
         Ok(())
     }
+
+    pub fn slot_sync_enabled(&self, slot: &str) -> bool {
+        self.sync.enabled
+            && self
+                .slots
+                .get(slot)
+                .and_then(|configuration| configuration.sync)
+                .unwrap_or(true)
+    }
+
+    fn resolve_sync(&self) -> SyncResolution {
+        if !self.sync.enabled {
+            return SyncResolution::Disabled;
+        }
+
+        let resolve = || -> Result<ResolvedSyncConfig, ConfigError> {
+            let relay_url = self
+                .sync
+                .relay_url
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| ConfigError::Invalid("sync.relay_url is required".into()))?;
+            let secure = relay_url.starts_with("wss://");
+            let permitted_insecure =
+                self.sync.allow_insecure_transport && relay_url.starts_with("ws://");
+            if !secure && !permitted_insecure {
+                return Err(ConfigError::Invalid(
+                    "sync.relay_url must use wss:// (or ws:// with the explicit development-only sync.allow_insecure_transport override)".into(),
+                ));
+            }
+
+            let reconnect_min_delay = parse_duration(
+                self.sync.reconnect_min_delay.as_deref().unwrap_or("1s"),
+                "sync.reconnect_min_delay",
+            )?;
+            let reconnect_max_delay = parse_duration(
+                self.sync.reconnect_max_delay.as_deref().unwrap_or("5m"),
+                "sync.reconnect_max_delay",
+            )?;
+            if reconnect_min_delay.is_zero() || reconnect_max_delay < reconnect_min_delay {
+                return Err(ConfigError::Invalid(
+                    "sync reconnect delays must be nonzero and max must be at least min".into(),
+                ));
+            }
+
+            Ok(ResolvedSyncConfig {
+                relay_url: relay_url.to_owned(),
+                reconnect_min_delay,
+                reconnect_max_delay,
+                device_name: self
+                    .sync
+                    .device_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "kclip-device".into()),
+                token_path: self
+                    .sync
+                    .token_path
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(default_token_path)?,
+                sync_key_path: self
+                    .security
+                    .sync_key_path
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(default_sync_key_path)?,
+                allow_insecure_transport: self.sync.allow_insecure_transport,
+            })
+        };
+
+        match resolve() {
+            Ok(settings) => SyncResolution::Ready(settings),
+            Err(error) => SyncResolution::Invalid(error.to_string()),
+        }
+    }
+}
+
+fn parse_duration(value: &str, field: &str) -> Result<Duration, ConfigError> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600_000)
+    } else {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must use ms, s, m, or h"
+        )));
+    };
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| ConfigError::Invalid(format!("{field} contains an invalid duration")))?;
+    let milliseconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| ConfigError::Invalid(format!("{field} duration is too large")))?;
+    Ok(Duration::from_millis(milliseconds))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +517,17 @@ pub fn default_config_path() -> Result<PathBuf, ConfigError> {
     Ok(home_dir()?.join(".config/kclip/config.toml"))
 }
 
+pub fn default_token_path() -> Result<PathBuf, ConfigError> {
+    Ok(default_config_path()?
+        .parent()
+        .expect("default configuration path has a parent")
+        .join("token.json"))
+}
+
+pub fn default_sync_key_path() -> Result<PathBuf, ConfigError> {
+    Ok(default_data_dir()?.join("sync.key"))
+}
+
 fn home_dir() -> Result<PathBuf, ConfigError> {
     env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -540,5 +672,50 @@ history_limit = 10
         assert!(update_config_file(&path, DEFAULTS).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn enabled_sync_requires_secure_transport_but_never_blocks_local_resolution() {
+        let insecure: Config = toml::from_str(
+            r#"
+[sync]
+enabled = true
+relay_url = "ws://clipboard.example/sync/v1"
+token_path = "/tmp/token"
+[security]
+sync_key_path = "/tmp/key"
+"#,
+        )
+        .unwrap();
+        let resolved = insecure
+            .resolve(
+                Some("/tmp/kclip.sock".into()),
+                Some("/tmp/kclip-data".into()),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(resolved.sync, SyncResolution::Invalid(_)));
+
+        let secure: Config = toml::from_str(
+            r#"
+[sync]
+enabled = true
+relay_url = "wss://clipboard.example/sync/v1"
+reconnect_min_delay = "500ms"
+reconnect_max_delay = "2m"
+token_path = "/tmp/token"
+[security]
+sync_key_path = "/tmp/key"
+"#,
+        )
+        .unwrap();
+        let resolved = secure
+            .resolve(
+                Some("/tmp/kclip.sock".into()),
+                Some("/tmp/kclip-data".into()),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(resolved.sync, SyncResolution::Ready(_)));
     }
 }

@@ -1,0 +1,23 @@
+[package]
+name = "kclip-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+bip39.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+kclip-protocol = { path = "../kclip-protocol" }
+libc.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+serde_cbor.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

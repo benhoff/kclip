@@ -11,8 +11,8 @@ UMask=0077
 RuntimeDirectory=kclip
 RuntimeDirectoryMode=0700
 
-# Phase 1 is local-only. This also prevents accidental network use.
-RestrictAddressFamilies=AF_UNIX
+# Local IPC plus outbound TLS/WebSocket synchronization. No public listener is opened.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
