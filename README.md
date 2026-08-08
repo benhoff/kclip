@@ -60,8 +60,11 @@ Useful non-interactive overrides:
 ```
 
 If `sudo` is unavailable, the default installation automatically falls back to
-`~/.local`. `make install` remains available and installs below the Makefile's
-`PREFIX`, which defaults to `~/.local`.
+`~/.local`. If the selected binary directory is not already on `PATH`, the
+installer adds it to the current user's Bash, Zsh, Fish, or POSIX shell profile;
+open a new shell afterward to use `kclip` by name. `make install` remains
+available and installs below the Makefile's `PREFIX`, which defaults to
+`~/.local`.
 
 ## Commands
 

@@ -20,6 +20,51 @@ warn() {
     printf 'Warning: %s\n' "$*" >&2
 }
 
+shell_quote() {
+    local value=$1
+    printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+ensure_bin_on_path() {
+    local shell_name profile marker quoted_bindir
+    shell_name=$(basename -- "${SHELL:-sh}")
+    marker="# Added by the kclip installer: ${BINDIR}"
+
+    case "$shell_name" in
+        bash)
+            profile="$HOME/.bashrc"
+            ;;
+        zsh)
+            profile="${ZDOTDIR:-$HOME}/.zshrc"
+            ;;
+        fish)
+            profile="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/kclip-path.fish"
+            ;;
+        *)
+            profile="$HOME/.profile"
+            ;;
+    esac
+
+    if [[ -f "$profile" ]] && grep -Fqx -- "$marker" "$profile"; then
+        info "PATH setup is already present in ${profile}; start a new shell to use kclip by name"
+        return
+    fi
+
+    mkdir -p -- "$(dirname -- "$profile")"
+    quoted_bindir=$(shell_quote "$BINDIR")
+    {
+        [[ ! -s "$profile" ]] || printf '\n'
+        printf '%s\n' "$marker"
+        if [[ "$shell_name" == fish ]]; then
+            printf 'fish_add_path --global %s\n' "$quoted_bindir"
+        else
+            printf 'export PATH=%s:"$PATH"\n' "$quoted_bindir"
+        fi
+    } >>"$profile"
+    info "Added ${BINDIR} to PATH in ${profile}"
+    info "Start a new shell to invoke kclip by name"
+}
+
 fail() {
     printf 'Error: %s\n' "$*" >&2
     exit 1
@@ -238,7 +283,7 @@ fi
 
 case ":${PATH}:" in
     *":${BINDIR}:"*) ;;
-    *) warn "${BINDIR} is not on PATH; add it before invoking kclip by name" ;;
+    *) ensure_bin_on_path ;;
 esac
 
 if ((START_SERVICE == 0)); then
