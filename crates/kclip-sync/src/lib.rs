@@ -10,6 +10,7 @@ use kclip_storage::{
     InboxEvent, OutboxItem, RemoteApplyOutcome, Storage, StorageError, unix_millis,
 };
 use serde::{Deserialize, Serialize};
+use snow::{Builder, params::NoiseParams};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -30,6 +31,16 @@ use tokio_tungstenite::{
 use tracing::{debug, info, warn};
 
 const MAX_JSON_OVERHEAD: usize = 1024 * 1024;
+const PAIRING_CODE_PREFIX: &str = "kclip-pair-v1";
+const NOISE_PROTOCOL_NAME: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
+const NOISE_TRANSPORT_NAME: &str = "noise-psk-v1";
+const NOISE_MAX_CIPHERTEXT_BYTES: usize = 65_535;
+const NOISE_TAG_BYTES: usize = 16;
+const CHUNK_HEADER_BYTES: usize = 1;
+const MAX_CHUNK_DATA_BYTES: usize =
+    NOISE_MAX_CIPHERTEXT_BYTES - NOISE_TAG_BYTES - CHUNK_HEADER_BYTES;
+const CHUNK_CONTINUES: u8 = 0;
+const CHUNK_FINAL: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -87,6 +98,27 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenFile {
     pub access_token: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PairingCredential {
+    pub version: u8,
+    pub pairing_id: String,
+    pub pairing_secret: String,
+}
+
+enum Authentication {
+    Noise {
+        credential: PairingCredential,
+        psk: [u8; 32],
+    },
+    LegacyBearer(TokenFile),
+}
+
+enum WireSecurity {
+    Noise(Box<snow::TransportState>),
+    Plain,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -225,24 +257,42 @@ async fn connect_once(
     wake: &Arc<Notify>,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), SyncError> {
+    let authentication = read_authentication(configuration)?;
+    let noise_authenticated = matches!(authentication, Authentication::Noise { .. });
     if !configuration.relay_url.starts_with("wss://")
+        && !(noise_authenticated && configuration.relay_url.starts_with("ws://"))
         && !(configuration.allow_insecure_transport && configuration.relay_url.starts_with("ws://"))
     {
         return Err(SyncError::Protocol(
             "relay transport is not permitted by synchronization configuration",
         ));
     }
-    let token = read_token(&configuration.token_path)?;
     let key = read_sync_key(&configuration.sync_key_path)
         .map_err(|error| SyncError::Credentials(error.to_string()))?;
 
     recover_inbox(storage, &key, max_content_size, status).await?;
 
     let mut request = configuration.relay_url.as_str().into_client_request()?;
-    let mut authorization = HeaderValue::from_str(&format!("Bearer {}", token.access_token))
-        .map_err(|_| SyncError::Credentials("access token cannot be used in a header".into()))?;
-    authorization.set_sensitive(true);
-    request.headers_mut().insert(AUTHORIZATION, authorization);
+    match &authentication {
+        Authentication::Noise { credential, .. } => {
+            request.headers_mut().insert(
+                "x-kclip-transport",
+                HeaderValue::from_static(NOISE_TRANSPORT_NAME),
+            );
+            request.headers_mut().insert(
+                "x-kclip-pairing-id",
+                HeaderValue::from_str(&credential.pairing_id)?,
+            );
+        }
+        Authentication::LegacyBearer(token) => {
+            let mut authorization =
+                HeaderValue::from_str(&format!("Bearer {}", token.access_token)).map_err(|_| {
+                    SyncError::Credentials("access token cannot be used in a header".into())
+                })?;
+            authorization.set_sensitive(true);
+            request.headers_mut().insert(AUTHORIZATION, authorization);
+        }
+    }
     let maximum_frame = usize::try_from(max_content_size)
         .unwrap_or(usize::MAX)
         .saturating_mul(2)
@@ -262,10 +312,18 @@ async fn connect_once(
                 other => SyncError::WebSocket(other),
             })?;
 
+    let mut wire_security = match authentication {
+        Authentication::Noise { psk, .. } => WireSecurity::Noise(Box::new(
+            noise_client_handshake(&mut websocket, &psk).await?,
+        )),
+        Authentication::LegacyBearer(_) => WireSecurity::Plain,
+    };
+
     let sync_status = storage.sync_status()?;
     let resume_after = sync_status.server_cursor;
     send_json(
         &mut websocket,
+        &mut wire_security,
         &ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
             device_id: storage.device_id()?,
@@ -273,7 +331,7 @@ async fn connect_once(
         },
     )
     .await?;
-    let ready = receive_json(&mut websocket, max_content_size).await?;
+    let ready = receive_json(&mut websocket, &mut wire_security, max_content_size).await?;
     match ready {
         ServerMessage::Ready {
             protocol_version,
@@ -311,10 +369,10 @@ async fn connect_once(
         if let Some(item) = storage.pending_outbox(1)?.into_iter().next() {
             let message_id = item.message_id.clone();
             let push = outbox_push(storage, &item, &key)?;
-            send_json(&mut websocket, &push).await?;
+            send_json(&mut websocket, &mut wire_security, &push).await?;
             loop {
                 let message = tokio::select! {
-                    value = receive_json(&mut websocket, max_content_size) => value?,
+                    value = receive_json(&mut websocket, &mut wire_security, max_content_size) => value?,
                     _ = stop.changed() => {
                         let _ = websocket.close(None).await;
                         return Ok(());
@@ -330,6 +388,7 @@ async fn connect_once(
                     MessageOutcome::Event(cursor) => {
                         send_json(
                             &mut websocket,
+                            &mut wire_security,
                             &ClientMessage::Checkpoint {
                                 server_sequence: cursor,
                             },
@@ -343,11 +402,11 @@ async fn connect_once(
         }
 
         tokio::select! {
-            message = receive_json(&mut websocket, max_content_size) => {
+            message = receive_json(&mut websocket, &mut wire_security, max_content_size) => {
                 if let MessageOutcome::Event(cursor) =
                     handle_server_message(storage, &key, max_content_size, status, message?).await?
                 {
-                    send_json(&mut websocket, &ClientMessage::Checkpoint { server_sequence: cursor }).await?;
+                    send_json(&mut websocket, &mut wire_security, &ClientMessage::Checkpoint { server_sequence: cursor }).await?;
                 }
             }
             _ = wake.notified() => {}
@@ -621,36 +680,156 @@ fn revision_metadata(revision: &RevisionV1) -> RevisionMetadata {
     }
 }
 
-async fn send_json<S>(socket: &mut S, message: &ClientMessage) -> Result<(), SyncError>
-where
-    S: futures_util::Sink<Message> + Unpin,
-    S::Error: std::error::Error + Send + Sync + 'static,
-{
-    let text = serde_json::to_string(message)?;
-    socket
-        .send(Message::Text(text.into()))
-        .await
-        .map_err(|error| SyncError::Transport(error.to_string()))
-}
-
-async fn receive_json<S>(socket: &mut S, max_content_size: u64) -> Result<ServerMessage, SyncError>
+async fn noise_client_handshake<S>(
+    socket: &mut S,
+    psk: &[u8; 32],
+) -> Result<snow::TransportState, SyncError>
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
         + Unpin,
 {
+    let parameters: NoiseParams = NOISE_PROTOCOL_NAME
+        .parse()
+        .map_err(|error: snow::Error| SyncError::Noise(error.to_string()))?;
+    let mut handshake = Builder::new(parameters)
+        .psk(0, psk)
+        .map_err(|error| SyncError::Noise(error.to_string()))?
+        .build_initiator()
+        .map_err(|error| SyncError::Noise(error.to_string()))?;
+    let mut first = [0_u8; 128];
+    let first_length = handshake
+        .write_message(&[], &mut first)
+        .map_err(|error| SyncError::Noise(error.to_string()))?;
+    socket
+        .send(Message::Binary(first[..first_length].to_vec().into()))
+        .await?;
+
+    let response = loop {
+        match socket.next().await.ok_or(SyncError::Authentication)?? {
+            Message::Binary(value) => break value,
+            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+            Message::Pong(_) => {}
+            Message::Close(_) => return Err(SyncError::Authentication),
+            _ => return Err(SyncError::Authentication),
+        }
+    };
+    let mut payload = [0_u8; 128];
+    handshake
+        .read_message(&response, &mut payload)
+        .map_err(|_| SyncError::Authentication)?;
+    handshake
+        .into_transport_mode()
+        .map_err(|error| SyncError::Noise(error.to_string()))
+}
+
+async fn send_json<S>(
+    socket: &mut S,
+    security: &mut WireSecurity,
+    message: &ClientMessage,
+) -> Result<(), SyncError>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let serialized = serde_json::to_vec(message)?;
+    match security {
+        WireSecurity::Plain => socket
+            .send(Message::Text(
+                String::from_utf8(serialized)
+                    .expect("serde_json always emits UTF-8")
+                    .into(),
+            ))
+            .await
+            .map_err(|error| SyncError::Transport(error.to_string())),
+        WireSecurity::Noise(state) => {
+            let chunk_count = serialized.len().div_ceil(MAX_CHUNK_DATA_BYTES).max(1);
+            for (index, chunk) in serialized.chunks(MAX_CHUNK_DATA_BYTES).enumerate() {
+                let flag = if index + 1 == chunk_count {
+                    CHUNK_FINAL
+                } else {
+                    CHUNK_CONTINUES
+                };
+                let mut plaintext = Vec::with_capacity(chunk.len() + 1);
+                plaintext.push(flag);
+                plaintext.extend_from_slice(chunk);
+                let mut ciphertext = vec![0_u8; plaintext.len() + NOISE_TAG_BYTES];
+                let length = state
+                    .write_message(&plaintext, &mut ciphertext)
+                    .map_err(|error| SyncError::Noise(error.to_string()))?;
+                ciphertext.truncate(length);
+                socket
+                    .send(Message::Binary(ciphertext.into()))
+                    .await
+                    .map_err(|error| SyncError::Transport(error.to_string()))?;
+            }
+            // serde_json messages are non-empty. Keep the framing definition
+            // total in case that invariant ever changes.
+            if serialized.is_empty() {
+                let mut ciphertext = vec![0_u8; 1 + NOISE_TAG_BYTES];
+                let length = state
+                    .write_message(&[CHUNK_FINAL], &mut ciphertext)
+                    .map_err(|error| SyncError::Noise(error.to_string()))?;
+                ciphertext.truncate(length);
+                socket
+                    .send(Message::Binary(ciphertext.into()))
+                    .await
+                    .map_err(|error| SyncError::Transport(error.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn receive_json<S>(
+    socket: &mut S,
+    security: &mut WireSecurity,
+    max_content_size: u64,
+) -> Result<ServerMessage, SyncError>
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
+{
+    let maximum = usize::try_from(max_content_size)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(2)
+        .saturating_add(MAX_JSON_OVERHEAD);
+    let mut assembled = Vec::new();
     loop {
         let message = socket.next().await.ok_or(SyncError::Disconnected)??;
         match message {
-            Message::Text(text) => {
-                let maximum = usize::try_from(max_content_size)
-                    .unwrap_or(usize::MAX)
-                    .saturating_mul(2)
-                    .saturating_add(MAX_JSON_OVERHEAD);
+            Message::Text(text) if matches!(security, WireSecurity::Plain) => {
                 if text.len() > maximum {
                     return Err(SyncError::Protocol("server frame exceeds local limit"));
                 }
                 return Ok(serde_json::from_str(&text)?);
+            }
+            Message::Binary(ciphertext) if matches!(security, WireSecurity::Noise(_)) => {
+                if ciphertext.is_empty() || ciphertext.len() > NOISE_MAX_CIPHERTEXT_BYTES {
+                    return Err(SyncError::Protocol("invalid encrypted transport frame"));
+                }
+                let WireSecurity::Noise(state) = security else {
+                    unreachable!()
+                };
+                let mut plaintext = vec![0_u8; ciphertext.len()];
+                let length = state
+                    .read_message(&ciphertext, &mut plaintext)
+                    .map_err(|_| SyncError::Authentication)?;
+                plaintext.truncate(length);
+                let Some((&flag, data)) = plaintext.split_first() else {
+                    return Err(SyncError::Protocol("empty encrypted transport chunk"));
+                };
+                if !matches!(flag, CHUNK_CONTINUES | CHUNK_FINAL) {
+                    return Err(SyncError::Protocol("invalid encrypted transport chunk"));
+                }
+                if assembled.len().saturating_add(data.len()) > maximum {
+                    return Err(SyncError::Protocol("server message exceeds local limit"));
+                }
+                assembled.extend_from_slice(data);
+                if flag == CHUNK_FINAL {
+                    return Ok(serde_json::from_slice(&assembled)?);
+                }
             }
             Message::Ping(payload) => {
                 socket.send(Message::Pong(payload)).await?;
@@ -658,7 +837,7 @@ where
             }
             Message::Pong(_) => continue,
             Message::Close(_) => return Err(SyncError::Disconnected),
-            _ => return Err(SyncError::Protocol("expected a JSON text frame")),
+            _ => return Err(SyncError::Protocol("unexpected WebSocket data frame")),
         }
     }
 }
@@ -683,6 +862,76 @@ fn jittered(delay: Duration, maximum: Duration) -> Duration {
     let fraction = u64::from_le_bytes(random) % 41;
     let percent = 80 + fraction;
     delay.mul_f64(percent as f64 / 100.0).min(maximum)
+}
+
+fn read_authentication(configuration: &ResolvedSyncConfig) -> Result<Authentication, SyncError> {
+    match fs::symlink_metadata(&configuration.pairing_path) {
+        Ok(_) => {
+            let credential = read_pairing(&configuration.pairing_path)?;
+            let psk = pairing_psk(&credential)?;
+            Ok(Authentication::Noise { credential, psk })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Authentication::LegacyBearer(
+            read_token(&configuration.token_path)?,
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn pairing_psk(credential: &PairingCredential) -> Result<[u8; 32], SyncError> {
+    if credential.version != 1
+        || credential.pairing_id.is_empty()
+        || credential.pairing_id.len() > 36
+    {
+        return Err(SyncError::Credentials("invalid pairing credential".into()));
+    }
+    let pairing_id = uuid::Uuid::parse_str(&credential.pairing_id)
+        .map_err(|_| SyncError::Credentials("invalid pairing credential".into()))?;
+    if pairing_id.to_string() != credential.pairing_id {
+        return Err(SyncError::Credentials("invalid pairing credential".into()));
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(&credential.pairing_secret)
+        .map_err(|_| SyncError::Credentials("invalid pairing credential".into()))?;
+    decoded
+        .try_into()
+        .map_err(|_| SyncError::Credentials("invalid pairing credential".into()))
+}
+
+pub fn read_pairing(path: &Path) -> Result<PairingCredential, SyncError> {
+    kclip_crypto::validate_secret_file(path)
+        .map_err(|error| SyncError::Credentials(error.to_string()))?;
+    if fs::metadata(path)?.len() > 4096 {
+        return Err(SyncError::Credentials(
+            "pairing credential file is too large".into(),
+        ));
+    }
+    let credential: PairingCredential = serde_json::from_slice(&fs::read(path)?)?;
+    pairing_psk(&credential)?;
+    Ok(credential)
+}
+
+pub fn write_pairing_code(path: &Path, code: &str) -> Result<(), SyncError> {
+    let parts: Vec<&str> = code.trim().split(':').collect();
+    if parts.len() != 3 || parts[0] != PAIRING_CODE_PREFIX {
+        return Err(SyncError::Credentials("invalid pairing code".into()));
+    }
+    let credential = PairingCredential {
+        version: 1,
+        pairing_id: parts[1].to_owned(),
+        pairing_secret: parts[2].to_owned(),
+    };
+    pairing_psk(&credential).map_err(|_| SyncError::Credentials("invalid pairing code".into()))?;
+    let bytes = serde_json::to_vec_pretty(&credential)?;
+    atomic_write_secret(path, &bytes).map_err(|error| SyncError::Credentials(error.to_string()))
+}
+
+pub fn remove_pairing(path: &Path) -> Result<bool, SyncError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn read_token(path: &Path) -> Result<TokenFile, SyncError> {
@@ -733,10 +982,10 @@ impl AuthClient {
     pub fn from_relay(relay_url: &str, token_path: PathBuf) -> Result<Self, SyncError> {
         let mut base_url = if let Some(rest) = relay_url.strip_prefix("wss://") {
             format!("https://{rest}")
-        } else if let Some(rest) = relay_url.strip_prefix("ws://") {
-            format!("http://{rest}")
         } else {
-            return Err(SyncError::Protocol("relay URL must use ws:// or wss://"));
+            return Err(SyncError::Protocol(
+                "password and bearer authentication requires wss://",
+            ));
         };
         if let Some(stripped) = base_url.strip_suffix("/sync/v1") {
             base_url = stripped.to_owned();
@@ -841,6 +1090,8 @@ pub enum SyncError {
     Io(#[from] io::Error),
     #[error("invalid HTTP header")]
     Header(#[from] tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue),
+    #[error("Noise protocol failed: {0}")]
+    Noise(String),
 }
 
 impl SyncError {
@@ -848,7 +1099,7 @@ impl SyncError {
         match self {
             Self::Credentials(_) => "credentials",
             Self::Authentication => "authentication",
-            Self::Protocol(_) | Self::Json(_) | Self::Header(_) => "protocol",
+            Self::Protocol(_) | Self::Json(_) | Self::Header(_) | Self::Noise(_) => "protocol",
             Self::Server(_) => "server",
             Self::Transport(_) | Self::Disconnected | Self::WebSocket(_) | Self::Http(_) => {
                 "connectivity"
@@ -877,6 +1128,76 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
 
+    async fn noise_server_handshake(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        psk: &[u8; 32],
+    ) -> snow::TransportState {
+        let parameters: NoiseParams = NOISE_PROTOCOL_NAME.parse().unwrap();
+        let mut handshake = Builder::new(parameters)
+            .psk(0, psk)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let Message::Binary(first) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected binary Noise handshake")
+        };
+        let mut payload = [0_u8; 128];
+        handshake.read_message(&first, &mut payload).unwrap();
+        let mut second = [0_u8; 128];
+        let length = handshake.write_message(&[], &mut second).unwrap();
+        socket
+            .send(Message::Binary(second[..length].to_vec().into()))
+            .await
+            .unwrap();
+        handshake.into_transport_mode().unwrap()
+    }
+
+    async fn noise_server_receive(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        state: &mut snow::TransportState,
+    ) -> ClientMessage {
+        let mut assembled = Vec::new();
+        loop {
+            let Message::Binary(ciphertext) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected encrypted binary frame")
+            };
+            let mut plaintext = vec![0_u8; ciphertext.len()];
+            let length = state.read_message(&ciphertext, &mut plaintext).unwrap();
+            plaintext.truncate(length);
+            let (&flag, data) = plaintext.split_first().unwrap();
+            assembled.extend_from_slice(data);
+            if flag == CHUNK_FINAL {
+                return serde_json::from_slice(&assembled).unwrap();
+            }
+            assert_eq!(flag, CHUNK_CONTINUES);
+        }
+    }
+
+    async fn noise_server_send(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        state: &mut snow::TransportState,
+        message: &ServerMessage,
+    ) {
+        let plaintext = serde_json::to_vec(message).unwrap();
+        for (index, chunk) in plaintext.chunks(MAX_CHUNK_DATA_BYTES).enumerate() {
+            let flag = if (index + 1) * MAX_CHUNK_DATA_BYTES >= plaintext.len() {
+                CHUNK_FINAL
+            } else {
+                CHUNK_CONTINUES
+            };
+            let mut framed = Vec::with_capacity(chunk.len() + 1);
+            framed.push(flag);
+            framed.extend_from_slice(chunk);
+            let mut ciphertext = vec![0_u8; framed.len() + NOISE_TAG_BYTES];
+            let length = state.write_message(&framed, &mut ciphertext).unwrap();
+            ciphertext.truncate(length);
+            socket
+                .send(Message::Binary(ciphertext.into()))
+                .await
+                .unwrap();
+        }
+    }
+
     fn storage(temp: &TempDir) -> Arc<Storage> {
         Arc::new(Storage::open(temp.path().join("db"), temp.path().join("blobs"), 1024).unwrap())
     }
@@ -902,6 +1223,47 @@ mod tests {
             ciphertext,
             tag,
             accepted_at: sequence as i64,
+        }
+    }
+
+    #[test]
+    fn pairing_codes_round_trip_into_private_credential_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("private/pairing.json");
+        let pairing_id = "eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5";
+        let psk = [29_u8; 32];
+        write_pairing_code(
+            &path,
+            &format!(
+                "{PAIRING_CODE_PREFIX}:{pairing_id}:{}",
+                URL_SAFE_NO_PAD.encode(psk)
+            ),
+        )
+        .unwrap();
+        let credential = read_pairing(&path).unwrap();
+        assert_eq!(credential.version, 1);
+        assert_eq!(credential.pairing_id, pairing_id);
+        assert_eq!(pairing_psk(&credential).unwrap(), psk);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(remove_pairing(&path).unwrap());
+        assert!(!remove_pairing(&path).unwrap());
+    }
+
+    #[test]
+    fn pairing_codes_reject_wrong_length_and_noncanonical_ids() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pairing.json");
+        for code in [
+            "not-a-pairing-code",
+            "kclip-pair-v1:EB6B89C3-6A6F-45FA-8DA7-B74EA00BBFD5:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "kclip-pair-v1:eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5:AAAA",
+        ] {
+            assert!(write_pairing_code(&path, code).is_err());
         }
     }
 
@@ -1150,7 +1512,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::result_large_err)]
-    async fn websocket_worker_authenticates_uploads_replays_and_checkpoints() {
+    async fn noise_worker_authenticates_uploads_replays_and_checkpoints() {
         let temp = TempDir::new().unwrap();
         let storage = storage(&temp);
         storage
@@ -1166,8 +1528,18 @@ mod tests {
             )
             .unwrap();
         let token_path = temp.path().join("config/token.json");
+        let pairing_path = temp.path().join("config/pairing.json");
         let key_path = temp.path().join("data/sync.key");
-        write_token(&token_path, "test-token").unwrap();
+        let pairing_id = "eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5";
+        let psk = [17_u8; 32];
+        write_pairing_code(
+            &pairing_path,
+            &format!(
+                "{PAIRING_CODE_PREFIX}:{pairing_id}:{}",
+                URL_SAFE_NO_PAD.encode(psk)
+            ),
+        )
+        .unwrap();
         let key = [23_u8; 32];
         kclip_crypto::write_sync_key(&key_path, &key).unwrap();
 
@@ -1179,18 +1551,22 @@ mod tests {
                 stream,
                 |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
                     assert_eq!(
-                        request.headers().get(AUTHORIZATION).unwrap(),
-                        "Bearer test-token"
+                        request.headers().get("x-kclip-transport").unwrap(),
+                        NOISE_TRANSPORT_NAME
                     );
+                    assert_eq!(
+                        request.headers().get("x-kclip-pairing-id").unwrap(),
+                        pairing_id
+                    );
+                    assert!(request.headers().get(AUTHORIZATION).is_none());
                     Ok(response)
                 },
             )
             .await
             .unwrap();
+            let mut noise = noise_server_handshake(&mut socket, &psk).await;
 
-            let hello: ClientMessage =
-                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
-                    .unwrap();
+            let hello = noise_server_receive(&mut socket, &mut noise).await;
             let ClientMessage::Hello {
                 device_id,
                 resume_after,
@@ -1200,23 +1576,19 @@ mod tests {
                 panic!("expected hello")
             };
             assert_eq!(resume_after, 0);
-            socket
-                .send(Message::Text(
-                    serde_json::to_string(&ServerMessage::Ready {
-                        protocol_version: PROTOCOL_VERSION,
-                        connection_id: "connection-1".into(),
-                        latest_sequence: 0,
-                        replay_from: 1,
-                    })
-                    .unwrap()
-                    .into(),
-                ))
-                .await
-                .unwrap();
+            noise_server_send(
+                &mut socket,
+                &mut noise,
+                &ServerMessage::Ready {
+                    protocol_version: PROTOCOL_VERSION,
+                    connection_id: "connection-1".into(),
+                    latest_sequence: 0,
+                    replay_from: 1,
+                },
+            )
+            .await;
 
-            let push: ClientMessage =
-                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
-                    .unwrap();
+            let push = noise_server_receive(&mut socket, &mut noise).await;
             let ClientMessage::Push {
                 message_id,
                 algorithm,
@@ -1228,38 +1600,32 @@ mod tests {
             else {
                 panic!("expected push")
             };
-            socket
-                .send(Message::Text(
-                    serde_json::to_string(&ServerMessage::PushAck {
-                        message_id: message_id.clone(),
-                        server_sequence: 1,
-                        duplicate: false,
-                    })
-                    .unwrap()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-            socket
-                .send(Message::Text(
-                    serde_json::to_string(&ServerMessage::Event {
-                        server_sequence: 1,
-                        message_id,
-                        sender_device_id: device_id,
-                        algorithm,
-                        nonce,
-                        ciphertext,
-                        tag,
-                        accepted_at: 1,
-                    })
-                    .unwrap()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-            let checkpoint: ClientMessage =
-                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
-                    .unwrap();
+            noise_server_send(
+                &mut socket,
+                &mut noise,
+                &ServerMessage::PushAck {
+                    message_id: message_id.clone(),
+                    server_sequence: 1,
+                    duplicate: false,
+                },
+            )
+            .await;
+            noise_server_send(
+                &mut socket,
+                &mut noise,
+                &ServerMessage::Event {
+                    server_sequence: 1,
+                    message_id,
+                    sender_device_id: device_id,
+                    algorithm,
+                    nonce,
+                    ciphertext,
+                    tag,
+                    accepted_at: 1,
+                },
+            )
+            .await;
+            let checkpoint = noise_server_receive(&mut socket, &mut noise).await;
             assert_eq!(checkpoint, ClientMessage::Checkpoint { server_sequence: 1 });
         });
 
@@ -1271,8 +1637,9 @@ mod tests {
                 reconnect_max_delay: Duration::from_millis(50),
                 device_name: "test".into(),
                 token_path,
+                pairing_path,
                 sync_key_path: key_path,
-                allow_insecure_transport: true,
+                allow_insecure_transport: false,
             },
             1024,
         );

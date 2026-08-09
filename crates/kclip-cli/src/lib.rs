@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
-use kclip_config::{Config, ConfigError, default_sync_key_path, default_token_path};
+use kclip_config::{
+    Config, ConfigError, default_pairing_path, default_sync_key_path, default_token_path,
+};
 use kclip_crypto::{
     atomic_write_secret, generate_sync_key, import_legacy_key, key_from_mnemonic, mnemonic_for_key,
     read_sync_key, write_sync_key,
@@ -9,7 +11,10 @@ use kclip_protocol::{
     ProtocolError, Request, Response, ResponsePayload, ResponseResult, RevisionMetadata,
     read_frame, write_frame,
 };
-use kclip_sync::{AuthClient, SyncError, TokenFile, read_token, remove_token, write_token};
+use kclip_sync::{
+    AuthClient, SyncError, TokenFile, read_pairing, read_token, remove_pairing, remove_token,
+    write_pairing_code, write_token,
+};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -91,7 +96,7 @@ pub enum Command {
     /// Show local daemon and synchronization health without exposing secrets.
     Status,
 
-    /// Manage the PyPasteServer account token.
+    /// Manage the PyPasteServer device credential.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -114,6 +119,8 @@ pub enum Command {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommand {
+    /// Store a one-time pairing code entered through hidden input.
+    Pair,
     Register {
         #[arg(long)]
         username: Option<String>,
@@ -290,24 +297,46 @@ async fn execute_auth(
         .clone()
         .map(Ok)
         .unwrap_or_else(default_token_path)?;
+    let pairing_path = config
+        .sync
+        .pairing_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_pairing_path)?;
     match command {
         AuthCommand::Status => {
-            let state = match read_token(&token_path) {
-                Ok(_) => "present",
-                Err(_) if token_path.exists() => "invalid_or_unsafe",
-                Err(_) => "missing",
+            let (method, state) = match read_pairing(&pairing_path) {
+                Ok(_) => ("noise_psk", "present"),
+                Err(_) if pairing_path.exists() => ("noise_psk", "invalid_or_unsafe"),
+                Err(_) => match read_token(&token_path) {
+                    Ok(_) => ("legacy_bearer", "present"),
+                    Err(_) if token_path.exists() => ("legacy_bearer", "invalid_or_unsafe"),
+                    Err(_) => ("none", "missing"),
+                },
             };
             if json {
                 write_json(
                     output,
                     &serde_json::json!({
-                        "token_present": state == "present",
+                        "authenticated": state == "present",
+                        "method": method,
                         "state": state
                     }),
                 )?;
             } else {
-                writeln!(output, "token: {state}")?;
+                writeln!(output, "authentication: {method} ({state})")?;
             }
+        }
+        AuthCommand::Pair => {
+            let code = rpassword::prompt_password("Pairing code: ")?;
+            if code.trim().is_empty() {
+                return Err(CliError::Usage("pairing code must not be empty".into()));
+            }
+            write_pairing_code(&pairing_path, &code)?;
+            // Never leave a bearer-token fallback behind after switching this
+            // device to pairing authentication.
+            remove_token(&token_path)?;
+            write_success(output, json, "paired")?;
         }
         AuthCommand::Register { username, email } => {
             let relay = configured_relay(&config)?;
@@ -338,7 +367,10 @@ async fn execute_auth(
             write_success(output, json, "logged_in")?;
         }
         AuthCommand::Logout { local } => {
-            if *local {
+            if pairing_path.exists() {
+                remove_pairing(&pairing_path)?;
+                remove_token(&token_path)?;
+            } else if *local {
                 remove_token(&token_path)?;
             } else {
                 let relay = configured_relay(&config)?;

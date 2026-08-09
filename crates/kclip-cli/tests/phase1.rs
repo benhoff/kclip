@@ -427,6 +427,7 @@ async fn offline_relay_never_blocks_local_clipboard_operations() {
             reconnect_max_delay: Duration::from_millis(50),
             device_name: "offline-test".into(),
             token_path,
+            pairing_path: temp.path().join("config/pairing.json"),
             sync_key_path: key_path,
             allow_insecure_transport: true,
         }),

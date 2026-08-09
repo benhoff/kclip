@@ -60,7 +60,8 @@ pub struct SyncConfig {
     pub reconnect_max_delay: Option<String>,
     pub device_name: Option<String>,
     pub token_path: Option<PathBuf>,
-    /// Development-only escape hatch for local test relays.
+    pub pairing_path: Option<PathBuf>,
+    /// Development-only escape hatch for legacy bearer tokens over ws://.
     pub allow_insecure_transport: bool,
 }
 
@@ -105,6 +106,7 @@ pub struct ResolvedSyncConfig {
     pub reconnect_max_delay: Duration,
     pub device_name: String,
     pub token_path: PathBuf,
+    pub pairing_path: PathBuf,
     pub sync_key_path: PathBuf,
     pub allow_insecure_transport: bool,
 }
@@ -236,12 +238,9 @@ impl Config {
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| ConfigError::Invalid("sync.relay_url is required".into()))?;
-            let secure = relay_url.starts_with("wss://");
-            let permitted_insecure =
-                self.sync.allow_insecure_transport && relay_url.starts_with("ws://");
-            if !secure && !permitted_insecure {
+            if !relay_url.starts_with("wss://") && !relay_url.starts_with("ws://") {
                 return Err(ConfigError::Invalid(
-                    "sync.relay_url must use wss:// (or ws:// with the explicit development-only sync.allow_insecure_transport override)".into(),
+                    "sync.relay_url must use ws:// or wss://".into(),
                 ));
             }
 
@@ -275,6 +274,12 @@ impl Config {
                     .clone()
                     .map(Ok)
                     .unwrap_or_else(default_token_path)?,
+                pairing_path: self
+                    .sync
+                    .pairing_path
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(default_pairing_path)?,
                 sync_key_path: self
                     .security
                     .sync_key_path
@@ -524,6 +529,13 @@ pub fn default_token_path() -> Result<PathBuf, ConfigError> {
         .join("token.json"))
 }
 
+pub fn default_pairing_path() -> Result<PathBuf, ConfigError> {
+    Ok(default_config_path()?
+        .parent()
+        .expect("default configuration path has a parent")
+        .join("pairing.json"))
+}
+
 pub fn default_sync_key_path() -> Result<PathBuf, ConfigError> {
     Ok(default_data_dir()?.join("sync.key"))
 }
@@ -675,8 +687,8 @@ history_limit = 10
     }
 
     #[test]
-    fn enabled_sync_requires_secure_transport_but_never_blocks_local_resolution() {
-        let insecure: Config = toml::from_str(
+    fn enabled_sync_accepts_noise_ws_and_rejects_non_websocket_urls() {
+        let paired_lan: Config = toml::from_str(
             r#"
 [sync]
 enabled = true
@@ -687,7 +699,20 @@ sync_key_path = "/tmp/key"
 "#,
         )
         .unwrap();
-        let resolved = insecure
+        let resolved = paired_lan
+            .resolve(
+                Some("/tmp/kclip.sock".into()),
+                Some("/tmp/kclip-data".into()),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(resolved.sync, SyncResolution::Ready(_)));
+
+        let invalid: Config = toml::from_str(
+            "[sync]\nenabled = true\nrelay_url = \"http://clipboard.example/sync/v1\"\n",
+        )
+        .unwrap();
+        let resolved = invalid
             .resolve(
                 Some("/tmp/kclip.sock".into()),
                 Some("/tmp/kclip-data".into()),
