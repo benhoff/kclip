@@ -371,16 +371,6 @@ async fn execute_sync_setup(
         .relay_url
         .as_deref()
         .filter(|value| !value.is_empty());
-    let has_account_metadata = config.sync.enabled || configured_account.is_some();
-    if has_account_metadata
-        && (configured_relay.is_some_and(|value| value != setup.relay_url)
-            || configured_account.is_some_and(|value| value != setup.username))
-    {
-        return Err(CliError::Usage(
-            "synchronization is already configured for a different relay or account; disconnecting and reconciling existing synchronized data must be done separately"
-                .into(),
-        ));
-    }
 
     let pairing_path = config
         .sync
@@ -396,14 +386,37 @@ async fn execute_sync_setup(
         .unwrap_or_else(default_sync_key_path)?;
     let existing_pairing = read_optional_pairing(&pairing_path)?;
     let existing_key = read_optional_sync_key(&key_path)?;
+    let relay_conflict = configured_relay.is_some_and(|value| value != setup.relay_url)
+        && (config.sync.enabled || configured_account.is_some() || existing_key.is_some());
+    let account_conflict = configured_account.is_some_and(|value| value != setup.username);
+    if relay_conflict || account_conflict {
+        write_setup_conflict(
+            output,
+            configured_relay,
+            configured_account,
+            &setup.relay_url,
+            &setup.username,
+        )?;
+        return Err(CliError::Reported(2));
+    }
+
+    let unlabeled_existing_key = existing_key.is_some()
+        && configured_account.is_none()
+        && (configured_relay.is_none() || configured_relay == Some(setup.relay_url.as_str()));
     if existing_key.is_some()
+        && !unlabeled_existing_key
         && (configured_relay != Some(setup.relay_url.as_str())
             || configured_account != Some(setup.username.as_str()))
     {
-        return Err(CliError::Usage(
-            "an account encryption key already exists, but the configured relay/account metadata does not match this setup code; refusing to guess which account owns the key"
-                .into(),
-        ));
+        writeln!(
+            output,
+            "Setup cannot safely match the existing account encryption key to this account."
+        )?;
+        writeln!(
+            output,
+            "Next: run `kclip sync recovery-code` to preserve the existing key before changing accounts."
+        )?;
+        return Err(CliError::Reported(2));
     }
 
     let prepared_config = prepare_sync_setup(
@@ -418,6 +431,35 @@ async fn execute_sync_setup(
     writeln!(output, "Account: {}", setup.username)?;
     writeln!(output, "Device:  {}", setup.device_name)?;
     writeln!(output)?;
+
+    if unlabeled_existing_key {
+        writeln!(
+            output,
+            "An existing account encryption key was found, but it predates account labels."
+        )?;
+        writeln!(
+            output,
+            "Reusing it avoids changing access to existing synchronized history."
+        )?;
+        let confirmation = read_line_prompt(
+            input,
+            output,
+            &format!(
+                "Confirm this key belongs to account {}? [y/N] ",
+                setup.username
+            ),
+            16,
+        )?;
+        if !matches!(confirmation.to_ascii_lowercase().as_str(), "y" | "yes") {
+            writeln!(output, "Setup cancelled; no files were changed.")?;
+            writeln!(
+                output,
+                "Next: run `kclip sync recovery-code` if you need to preserve this unlabelled key."
+            )?;
+            return Err(CliError::Reported(2));
+        }
+        writeln!(output)?;
+    }
 
     let mut new_key = None;
     if existing_key.is_none() {
@@ -504,6 +546,13 @@ async fn execute_sync_setup(
     )?;
 
     writeln!(output)?;
+    if unlabeled_existing_key {
+        writeln!(
+            output,
+            "✓ Existing account encryption key associated with {}",
+            setup.username
+        )?;
+    }
     writeln!(output, "✓ Device credential stored")?;
     writeln!(output, "✓ Synchronization configuration updated")?;
 
@@ -802,6 +851,38 @@ fn read_optional_sync_key(path: &Path) -> Result<Option<[u8; 32]>, CliError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn write_setup_conflict(
+    output: &mut dyn Write,
+    current_relay: Option<&str>,
+    current_account: Option<&str>,
+    requested_relay: &str,
+    requested_account: &str,
+) -> Result<(), CliError> {
+    writeln!(
+        output,
+        "Setup cannot replace a different synchronization account in this local profile."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Current relay:   {}",
+        current_relay.unwrap_or("not recorded")
+    )?;
+    writeln!(
+        output,
+        "Current account: {}",
+        current_account.unwrap_or("not recorded")
+    )?;
+    writeln!(output, "Requested relay:   {requested_relay}")?;
+    writeln!(output, "Requested account: {requested_account}")?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Next: use a setup code for the current relay/account. Replacing accounts requires a separate data-reconciliation workflow."
+    )?;
+    Ok(())
 }
 
 fn restore_pairing(path: &Path, previous: Option<&PairingCredential>) -> Result<(), CliError> {
@@ -1513,6 +1594,139 @@ mod tests {
         let rendered = String::from_utf8(output).unwrap();
         assert!(!rendered.contains(&fixture));
         assert!(!rendered.contains("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"));
+
+        unsafe {
+            match old_config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match old_data {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unlabeled_existing_key_can_be_explicitly_confirmed_without_migration_steps() {
+        let _environment = ENVIRONMENT.lock().await;
+        let temp = TempDir::new().unwrap();
+        let config_home = temp.path().join("config-home");
+        let data_home = temp.path().join("data-home");
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+        let old_data = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+        let config_path = config_home.join("kclip/config.toml");
+        let pairing_path = config_home.join("kclip/pairing.json");
+        let key_path = data_home.join("kclip/sync.key");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            "[sync]\nenabled = true\nrelay_url = \"wss://clipboard.example.test/sync/v1\"\ndevice_name = \"legacy-device\"\n",
+        )
+        .unwrap();
+        let old_pairing = credential("8d5f7f7c-cbc5-4e05-ab9f-ecf002cbd42c", 9);
+        write_pairing(&pairing_path, &old_pairing).unwrap();
+        write_sync_key(&key_path, &[6_u8; 32]).unwrap();
+        let original_config = fs::read(&config_path).unwrap();
+        let original_pairing = fs::read(&pairing_path).unwrap();
+        let cli = Cli {
+            socket: Some(temp.path().join("mock.sock")),
+            json: false,
+            command: Command::Sync {
+                command: SyncCommand::Setup,
+            },
+        };
+        let fixture = include_str!("../../../fixtures/kclip-setup-v1.txt")
+            .trim()
+            .to_owned();
+
+        let mut decline_secrets = MockSecrets {
+            values: VecDeque::from([fixture.clone()]),
+        };
+        let mut decline_runtime = MockRuntime {
+            restart: RestartOutcome::Restarted,
+            statuses: VecDeque::new(),
+            delays: 0,
+        };
+        let mut decline_input = Cursor::new(b"n\n".to_vec());
+        let mut decline_output = Vec::new();
+        let declined = execute_with_runtime(
+            &cli,
+            &mut decline_input,
+            &mut decline_output,
+            &mut decline_secrets,
+            &mut decline_runtime,
+        )
+        .await;
+        assert!(matches!(declined, Err(CliError::Reported(2))));
+        assert_eq!(fs::read(&config_path).unwrap(), original_config);
+        assert_eq!(fs::read(&pairing_path).unwrap(), original_pairing);
+        assert_eq!(read_sync_key(&key_path).unwrap(), [6_u8; 32]);
+
+        fs::write(
+            &config_path,
+            "[sync]\nenabled = true\nrelay_url = \"wss://clipboard.example.test/sync/v1\"\naccount_name = \"bob\"\ndevice_name = \"other-account\"\n",
+        )
+        .unwrap();
+        let conflicting_config = fs::read(&config_path).unwrap();
+        let mut conflict_secrets = MockSecrets {
+            values: VecDeque::from([fixture.clone()]),
+        };
+        let mut conflict_runtime = MockRuntime {
+            restart: RestartOutcome::Restarted,
+            statuses: VecDeque::new(),
+            delays: 0,
+        };
+        let mut conflict_input = Cursor::new(Vec::new());
+        let mut conflict_output = Vec::new();
+        let conflict = execute_with_runtime(
+            &cli,
+            &mut conflict_input,
+            &mut conflict_output,
+            &mut conflict_secrets,
+            &mut conflict_runtime,
+        )
+        .await;
+        assert!(matches!(conflict, Err(CliError::Reported(2))));
+        assert_eq!(fs::read(&config_path).unwrap(), conflicting_config);
+        let conflict_output = String::from_utf8(conflict_output).unwrap();
+        assert!(conflict_output.contains("Current account: bob"));
+        assert!(conflict_output.contains("Requested account: alice"));
+        fs::write(&config_path, &original_config).unwrap();
+
+        let mut ready = daemon_status(None);
+        ready.synchronization_state = "connected".into();
+        ready.authenticated = true;
+        let mut confirm_secrets = MockSecrets {
+            values: VecDeque::from([fixture]),
+        };
+        let mut confirm_runtime = MockRuntime {
+            restart: RestartOutcome::Restarted,
+            statuses: VecDeque::from([Some(ready)]),
+            delays: 0,
+        };
+        let mut confirm_input = Cursor::new(b"y\n".to_vec());
+        let mut confirm_output = Vec::new();
+        execute_with_runtime(
+            &cli,
+            &mut confirm_input,
+            &mut confirm_output,
+            &mut confirm_secrets,
+            &mut confirm_runtime,
+        )
+        .await
+        .unwrap();
+        let configured = Config::load(Some(&config_path)).unwrap();
+        assert_eq!(configured.sync.account_name.as_deref(), Some("alice"));
+        assert_eq!(read_sync_key(&key_path).unwrap(), [6_u8; 32]);
+        let output = String::from_utf8(confirm_output).unwrap();
+        assert!(output.contains("predates account labels"));
+        assert!(output.contains("Existing account encryption key associated with alice"));
+        assert!(output.contains("Synchronization is ready."));
 
         unsafe {
             match old_config {

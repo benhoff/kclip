@@ -146,6 +146,11 @@ live Noise connection. First-device setup displays 24 recovery words once;
 additional devices enter those same words through hidden input. Use
 `kclip sync status` for an actionable local-and-live checklist.
 
+If setup finds an existing key created before account labels were introduced,
+it shows the requested account and asks for explicit confirmation before
+reusing that key. A real relay or account conflict still stops without changing
+local files.
+
 Use `kclip copy --local` for values that must never enter the durable outbox.
 `[slots.NAME] sync = false` enforces the same policy for a whole slot. A normal
 copy succeeds after the local SQLite transaction commits; it never waits for

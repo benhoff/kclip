@@ -258,8 +258,13 @@ The initial implementation supports one account per local profile.
   separate design problem.
 - If a valid sync key already exists and the stored relay/account metadata
   matches, reuse it. Never replace or regenerate it silently.
-- If a key exists but the account cannot be matched, abort with an explanation
-  rather than guessing.
+- If a key exists without account metadata and the stored relay is either
+  missing or matches the setup code, explain that the key predates account
+  labels and require explicit confirmation before associating it with the
+  setup-code account. Declining MUST leave every file unchanged. A conflicting
+  stored relay or account MUST still abort with both current and requested
+  non-secret metadata plus an actionable explanation; never guess or replace
+  the key.
 - A new setup code for the same account MAY replace the local pairing
   credential. After success, display the previous pairing ID and advise the
   operator to revoke that old device entry on the server.
