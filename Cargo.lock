@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "kclip-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "kclip-config",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "kclip-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kclip-protocol",
  "serde",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "kclip-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "bip39",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "kclip-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "kclip-config",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "kclip-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "kclip-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kclip-protocol",
  "rusqlite",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "kclip-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "futures-util",
