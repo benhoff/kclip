@@ -284,11 +284,6 @@ pub fn key_from_mnemonic(words: &str) -> Result<[u8; SYNC_KEY_SIZE], CryptoError
         .map_err(|_| CryptoError::InvalidMnemonic)
 }
 
-pub fn import_legacy_key(source: &Path, destination: &Path) -> Result<(), CryptoError> {
-    let key = read_sync_key(source)?;
-    write_sync_key(destination, &key)
-}
-
 pub fn validate_secret_file(path: &Path) -> Result<(), CryptoError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| CryptoError::Read {
         path: path.to_path_buf(),

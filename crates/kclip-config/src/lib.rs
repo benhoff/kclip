@@ -56,13 +56,11 @@ pub struct PlasmaConfig {
 pub struct SyncConfig {
     pub enabled: bool,
     pub relay_url: Option<String>,
+    pub account_name: Option<String>,
     pub reconnect_min_delay: Option<String>,
     pub reconnect_max_delay: Option<String>,
     pub device_name: Option<String>,
-    pub token_path: Option<PathBuf>,
     pub pairing_path: Option<PathBuf>,
-    /// Development-only escape hatch for legacy bearer tokens over ws://.
-    pub allow_insecure_transport: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -102,13 +100,12 @@ pub enum SyncResolution {
 #[derive(Debug, Clone)]
 pub struct ResolvedSyncConfig {
     pub relay_url: String,
+    pub account_name: String,
     pub reconnect_min_delay: Duration,
     pub reconnect_max_delay: Duration,
     pub device_name: String,
-    pub token_path: PathBuf,
     pub pairing_path: PathBuf,
     pub sync_key_path: PathBuf,
-    pub allow_insecure_transport: bool,
 }
 
 impl Config {
@@ -226,6 +223,10 @@ impl Config {
                 .unwrap_or(true)
     }
 
+    pub fn sync_resolution(&self) -> SyncResolution {
+        self.resolve_sync()
+    }
+
     fn resolve_sync(&self) -> SyncResolution {
         if !self.sync.enabled {
             return SyncResolution::Disabled;
@@ -238,11 +239,26 @@ impl Config {
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| ConfigError::Invalid("sync.relay_url is required".into()))?;
-            if !relay_url.starts_with("wss://") && !relay_url.starts_with("ws://") {
+            let parsed_relay = url::Url::parse(relay_url)
+                .map_err(|_| ConfigError::Invalid("sync.relay_url is invalid".into()))?;
+            if !matches!(parsed_relay.scheme(), "ws" | "wss")
+                || parsed_relay.host_str().is_none()
+                || !parsed_relay.username().is_empty()
+                || parsed_relay.password().is_some()
+                || parsed_relay.path() != "/sync/v1"
+                || parsed_relay.query().is_some()
+                || parsed_relay.fragment().is_some()
+            {
                 return Err(ConfigError::Invalid(
-                    "sync.relay_url must use ws:// or wss://".into(),
+                    "sync.relay_url must be ws:// or wss:// with the exact path /sync/v1 and no credentials, query, or fragment".into(),
                 ));
             }
+            let account_name = self
+                .sync
+                .account_name
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ConfigError::Invalid("sync.account_name is required".into()))?;
 
             let reconnect_min_delay = parse_duration(
                 self.sync.reconnect_min_delay.as_deref().unwrap_or("1s"),
@@ -260,6 +276,7 @@ impl Config {
 
             Ok(ResolvedSyncConfig {
                 relay_url: relay_url.to_owned(),
+                account_name,
                 reconnect_min_delay,
                 reconnect_max_delay,
                 device_name: self
@@ -268,12 +285,6 @@ impl Config {
                     .clone()
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or_else(|| "kclip-device".into()),
-                token_path: self
-                    .sync
-                    .token_path
-                    .clone()
-                    .map(Ok)
-                    .unwrap_or_else(default_token_path)?,
                 pairing_path: self
                     .sync
                     .pairing_path
@@ -286,7 +297,6 @@ impl Config {
                     .clone()
                     .map(Ok)
                     .unwrap_or_else(default_sync_key_path)?,
-                allow_insecure_transport: self.sync.allow_insecure_transport,
             })
         };
 
@@ -325,6 +335,147 @@ pub enum ConfigUpdate {
     Created,
     Updated { backup_path: PathBuf },
     Unchanged,
+}
+
+/// A fully rendered and validated synchronization configuration change.
+/// Preparing is read-only; `commit` performs the private backup and atomic
+/// replacement after callers have staged any credential files.
+pub struct PreparedSyncConfig {
+    path: PathBuf,
+    contents: Vec<u8>,
+    previous: Option<Vec<u8>>,
+    changed: bool,
+}
+
+impl PreparedSyncConfig {
+    pub fn commit(self) -> Result<ConfigUpdate, ConfigError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            ConfigError::Invalid("configuration path has no parent directory".into())
+        })?;
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            ConfigError::Write {
+                path: parent.to_path_buf(),
+                source,
+            }
+        })?;
+
+        if !self.changed {
+            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600)).map_err(
+                |source| ConfigError::Write {
+                    path: self.path.clone(),
+                    source,
+                },
+            )?;
+            return Ok(ConfigUpdate::Unchanged);
+        }
+
+        let update = if let Some(previous) = self.previous {
+            let backup_path = backup_path(&self.path)?;
+            atomic_write_private(&backup_path, &previous)?;
+            ConfigUpdate::Updated { backup_path }
+        } else {
+            ConfigUpdate::Created
+        };
+        atomic_write_private(&self.path, &self.contents)?;
+        Ok(update)
+    }
+}
+
+/// Render the setup-owned `[sync]` fields while preserving every unrelated
+/// table and custom slot. No filesystem mutation occurs until `commit`.
+pub fn prepare_sync_setup(
+    path: &Path,
+    relay_url: &str,
+    account_name: &str,
+    device_name: &str,
+) -> Result<PreparedSyncConfig, ConfigError> {
+    prepare_sync_change(path, |sync| {
+        sync.insert("enabled".into(), toml::Value::Boolean(true));
+        sync.insert("relay_url".into(), toml::Value::String(relay_url.into()));
+        sync.insert(
+            "account_name".into(),
+            toml::Value::String(account_name.into()),
+        );
+        sync.insert(
+            "device_name".into(),
+            toml::Value::String(device_name.into()),
+        );
+    })
+}
+
+pub fn prepare_sync_disconnect(path: &Path) -> Result<PreparedSyncConfig, ConfigError> {
+    prepare_sync_change(path, |sync| {
+        sync.insert("enabled".into(), toml::Value::Boolean(false));
+    })
+}
+
+fn prepare_sync_change(
+    path: &Path,
+    change: impl FnOnce(&mut toml::map::Map<String, toml::Value>),
+) -> Result<PreparedSyncConfig, ConfigError> {
+    let previous = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(ConfigError::UnsafeFile(path.to_path_buf()));
+            }
+            Some(fs::read(path).map_err(|source| ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut document = match previous.as_deref() {
+        Some(contents) => {
+            toml::from_slice::<toml::Value>(contents).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?
+        }
+        None => toml::Value::Table(toml::map::Map::new()),
+    };
+    let original_document = document.clone();
+    let root = document.as_table_mut().ok_or_else(|| {
+        ConfigError::Invalid("configuration document must be a TOML table".into())
+    })?;
+    let sync = root
+        .entry("sync")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError::Invalid("sync must be a TOML table".into()))?;
+    change(sync);
+    let rendered = toml::to_string_pretty(&document).map_err(|source| ConfigError::Serialize {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let parsed: Config = toml::from_str(&rendered).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    parsed.validate_phase_one()?;
+    if parsed.sync.enabled && !matches!(parsed.resolve_sync(), SyncResolution::Ready(_)) {
+        let SyncResolution::Invalid(message) = parsed.resolve_sync() else {
+            unreachable!()
+        };
+        return Err(ConfigError::Invalid(message));
+    }
+    let changed = previous.is_none() || document != original_document;
+    Ok(PreparedSyncConfig {
+        path: path.to_path_buf(),
+        contents: rendered.into_bytes(),
+        previous,
+        changed,
+    })
 }
 
 pub fn update_config_file(
@@ -522,13 +673,6 @@ pub fn default_config_path() -> Result<PathBuf, ConfigError> {
     Ok(home_dir()?.join(".config/kclip/config.toml"))
 }
 
-pub fn default_token_path() -> Result<PathBuf, ConfigError> {
-    Ok(default_config_path()?
-        .parent()
-        .expect("default configuration path has a parent")
-        .join("token.json"))
-}
-
 pub fn default_pairing_path() -> Result<PathBuf, ConfigError> {
     Ok(default_config_path()?
         .parent()
@@ -693,7 +837,7 @@ history_limit = 10
 [sync]
 enabled = true
 relay_url = "ws://clipboard.example/sync/v1"
-token_path = "/tmp/token"
+account_name = "alice"
 [security]
 sync_key_path = "/tmp/key"
 "#,
@@ -726,9 +870,9 @@ sync_key_path = "/tmp/key"
 [sync]
 enabled = true
 relay_url = "wss://clipboard.example/sync/v1"
+account_name = "alice"
 reconnect_min_delay = "500ms"
 reconnect_max_delay = "2m"
-token_path = "/tmp/token"
 [security]
 sync_key_path = "/tmp/key"
 "#,
@@ -742,5 +886,65 @@ sync_key_path = "/tmp/key"
             )
             .unwrap();
         assert!(matches!(resolved.sync, SyncResolution::Ready(_)));
+    }
+
+    #[test]
+    fn guided_setup_preserves_custom_values_and_creates_private_backup() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("kclip/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "[daemon]\nmax_content_size = 42\n\n[slots.private]\nsync = false\n",
+        )
+        .unwrap();
+
+        let prepared = prepare_sync_setup(
+            &path,
+            "wss://clipboard.example.test/sync/v1",
+            "alice",
+            "office-laptop",
+        )
+        .unwrap();
+        let ConfigUpdate::Updated { backup_path } = prepared.commit().unwrap() else {
+            panic!("expected an update")
+        };
+        let configured = Config::load(Some(&path)).unwrap();
+        assert!(configured.sync.enabled);
+        assert_eq!(configured.sync.account_name.as_deref(), Some("alice"));
+        assert_eq!(
+            configured.sync.device_name.as_deref(),
+            Some("office-laptop")
+        );
+        assert_eq!(configured.daemon.max_content_size, Some(42));
+        assert_eq!(configured.slots["private"].sync, Some(false));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            prepare_sync_setup(
+                &path,
+                "wss://clipboard.example.test/sync/v1",
+                "alice",
+                "office-laptop",
+            )
+            .unwrap()
+            .commit()
+            .unwrap(),
+            ConfigUpdate::Unchanged
+        );
     }
 }

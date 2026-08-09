@@ -10,6 +10,7 @@ kclip-protocol = { path = "../kclip-protocol" }
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -320,6 +320,7 @@ fi
 
 if systemctl --user is-active --quiet kclipd.service; then
     info "kclip is installed and kclipd is running"
+    info "To configure encrypted synchronization, run: kclip sync setup"
 else
     warn "kclipd did not become active; inspect it with: journalctl --user -u kclipd.service"
     exit 1

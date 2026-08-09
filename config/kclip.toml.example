@@ -1,4 +1,5 @@
-# All fields are optional. Synchronization stays disabled until explicitly enabled.
+# Fields may be omitted while synchronization is disabled. `kclip sync setup`
+# populates the fields required to enable it.
 
 [daemon]
 # socket_path = "/run/user/1000/kclip/kclipd.sock"
@@ -22,14 +23,11 @@ text_only = true
 [sync]
 enabled = false
 relay_url = "ws://192.168.1.50:8001/sync/v1"
+# account_name is populated by `kclip sync setup`.
 reconnect_min_delay = "1s"
 reconnect_max_delay = "5m"
 device_name = "workstation"
-# token_path = "/home/example/.config/kclip/token.json"
 # pairing_path = "/home/example/.config/kclip/pairing.json"
-# Development tests only: allow a legacy bearer token to use ws://. Noise-paired
-# clients do not need this setting.
-allow_insecure_transport = false
 
 [security]
 require_encrypted_sync = true

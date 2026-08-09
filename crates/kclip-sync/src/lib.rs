@@ -11,27 +11,20 @@ use kclip_storage::{
 };
 use serde::{Deserialize, Serialize};
 use snow::{Builder, params::NoiseParams};
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{fs, io, path::Path, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::{Notify, RwLock, watch};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{
-        Message,
-        client::IntoClientRequest,
-        http::{HeaderValue, header::AUTHORIZATION},
-        protocol::WebSocketConfig,
+        Message, client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig,
     },
 };
 use tracing::{debug, info, warn};
 
 const MAX_JSON_OVERHEAD: usize = 1024 * 1024;
-const PAIRING_CODE_PREFIX: &str = "kclip-pair-v1";
+const SETUP_CODE_PREFIX: &str = "kclip-setup-v1";
+const MAX_SETUP_CODE_BYTES: usize = 16 * 1024;
 const NOISE_PROTOCOL_NAME: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const NOISE_TRANSPORT_NAME: &str = "noise-psk-v1";
 const NOISE_MAX_CIPHERTEXT_BYTES: usize = 65_535;
@@ -95,11 +88,6 @@ pub enum ServerMessage {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenFile {
-    pub access_token: String,
-}
-
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PairingCredential {
@@ -108,17 +96,87 @@ pub struct PairingCredential {
     pub pairing_secret: String,
 }
 
-enum Authentication {
-    Noise {
-        credential: PairingCredential,
-        psk: [u8; 32],
-    },
-    LegacyBearer(TokenFile),
+/// A validated administrative setup handoff. Its custom `Debug`
+/// implementation intentionally omits the pairing secret.
+#[derive(Clone)]
+pub struct DeviceSetupCodeV1 {
+    pub relay_url: String,
+    pub username: String,
+    pub device_name: String,
+    credential: PairingCredential,
 }
 
-enum WireSecurity {
-    Noise(Box<snow::TransportState>),
-    Plain,
+impl std::fmt::Debug for DeviceSetupCodeV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceSetupCodeV1")
+            .field("relay_url", &self.relay_url)
+            .field("username", &self.username)
+            .field("device_name", &self.device_name)
+            .field("pairing_id", &self.credential.pairing_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeviceSetupCodeV1 {
+    pub fn parse(value: &str) -> Result<Self, SyncError> {
+        if value.len() > MAX_SETUP_CODE_BYTES {
+            return Err(SyncError::SetupCode("setup code is too large"));
+        }
+        let (prefix, encoded) = value
+            .split_once(':')
+            .ok_or(SyncError::SetupCode("invalid setup code"))?;
+        if prefix != SETUP_CODE_PREFIX || encoded.is_empty() || encoded.contains('=') {
+            return Err(SyncError::SetupCode("invalid setup code"));
+        }
+        let decoded = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| SyncError::SetupCode("invalid setup code"))?;
+        if URL_SAFE_NO_PAD.encode(&decoded) != encoded {
+            return Err(SyncError::SetupCode("noncanonical setup code"));
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Payload {
+            version: u8,
+            relay_url: String,
+            username: String,
+            device_name: String,
+            pairing_id: String,
+            pairing_secret: String,
+        }
+
+        let payload: Payload = serde_json::from_slice(&decoded)
+            .map_err(|_| SyncError::SetupCode("invalid setup code payload"))?;
+        if payload.version != 1 || payload.username.is_empty() || payload.device_name.is_empty() {
+            return Err(SyncError::SetupCode("invalid setup code payload"));
+        }
+        validate_relay_url(&payload.relay_url)?;
+        let credential = PairingCredential {
+            version: 1,
+            pairing_id: payload.pairing_id,
+            pairing_secret: payload.pairing_secret,
+        };
+        pairing_psk(&credential).map_err(|_| SyncError::SetupCode("invalid setup code payload"))?;
+        if URL_SAFE_NO_PAD.encode(pairing_psk(&credential)?) != credential.pairing_secret {
+            return Err(SyncError::SetupCode("noncanonical pairing secret"));
+        }
+        Ok(Self {
+            relay_url: payload.relay_url,
+            username: payload.username,
+            device_name: payload.device_name,
+            credential,
+        })
+    }
+
+    pub fn pairing_id(&self) -> &str {
+        &self.credential.pairing_id
+    }
+
+    pub fn pairing_credential(&self) -> PairingCredential {
+        self.credential.clone()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -257,42 +315,23 @@ async fn connect_once(
     wake: &Arc<Notify>,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), SyncError> {
-    let authentication = read_authentication(configuration)?;
-    let noise_authenticated = matches!(authentication, Authentication::Noise { .. });
-    if !configuration.relay_url.starts_with("wss://")
-        && !(noise_authenticated && configuration.relay_url.starts_with("ws://"))
-        && !(configuration.allow_insecure_transport && configuration.relay_url.starts_with("ws://"))
-    {
-        return Err(SyncError::Protocol(
-            "relay transport is not permitted by synchronization configuration",
-        ));
-    }
+    validate_relay_url(&configuration.relay_url)?;
+    let credential = read_pairing(&configuration.pairing_path)?;
+    let psk = pairing_psk(&credential)?;
     let key = read_sync_key(&configuration.sync_key_path)
         .map_err(|error| SyncError::Credentials(error.to_string()))?;
 
     recover_inbox(storage, &key, max_content_size, status).await?;
 
     let mut request = configuration.relay_url.as_str().into_client_request()?;
-    match &authentication {
-        Authentication::Noise { credential, .. } => {
-            request.headers_mut().insert(
-                "x-kclip-transport",
-                HeaderValue::from_static(NOISE_TRANSPORT_NAME),
-            );
-            request.headers_mut().insert(
-                "x-kclip-pairing-id",
-                HeaderValue::from_str(&credential.pairing_id)?,
-            );
-        }
-        Authentication::LegacyBearer(token) => {
-            let mut authorization =
-                HeaderValue::from_str(&format!("Bearer {}", token.access_token)).map_err(|_| {
-                    SyncError::Credentials("access token cannot be used in a header".into())
-                })?;
-            authorization.set_sensitive(true);
-            request.headers_mut().insert(AUTHORIZATION, authorization);
-        }
-    }
+    request.headers_mut().insert(
+        "x-kclip-transport",
+        HeaderValue::from_static(NOISE_TRANSPORT_NAME),
+    );
+    request.headers_mut().insert(
+        "x-kclip-pairing-id",
+        HeaderValue::from_str(&credential.pairing_id)?,
+    );
     let maximum_frame = usize::try_from(max_content_size)
         .unwrap_or(usize::MAX)
         .saturating_mul(2)
@@ -312,12 +351,7 @@ async fn connect_once(
                 other => SyncError::WebSocket(other),
             })?;
 
-    let mut wire_security = match authentication {
-        Authentication::Noise { psk, .. } => WireSecurity::Noise(Box::new(
-            noise_client_handshake(&mut websocket, &psk).await?,
-        )),
-        Authentication::LegacyBearer(_) => WireSecurity::Plain,
-    };
+    let mut wire_security = noise_client_handshake(&mut websocket, &psk).await?;
 
     let sync_status = storage.sync_status()?;
     let resume_after = sync_status.server_cursor;
@@ -725,7 +759,7 @@ where
 
 async fn send_json<S>(
     socket: &mut S,
-    security: &mut WireSecurity,
+    security: &mut snow::TransportState,
     message: &ClientMessage,
 ) -> Result<(), SyncError>
 where
@@ -733,57 +767,43 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let serialized = serde_json::to_vec(message)?;
-    match security {
-        WireSecurity::Plain => socket
-            .send(Message::Text(
-                String::from_utf8(serialized)
-                    .expect("serde_json always emits UTF-8")
-                    .into(),
-            ))
+    let chunk_count = serialized.len().div_ceil(MAX_CHUNK_DATA_BYTES).max(1);
+    for (index, chunk) in serialized.chunks(MAX_CHUNK_DATA_BYTES).enumerate() {
+        let flag = if index + 1 == chunk_count {
+            CHUNK_FINAL
+        } else {
+            CHUNK_CONTINUES
+        };
+        let mut plaintext = Vec::with_capacity(chunk.len() + 1);
+        plaintext.push(flag);
+        plaintext.extend_from_slice(chunk);
+        let mut ciphertext = vec![0_u8; plaintext.len() + NOISE_TAG_BYTES];
+        let length = security
+            .write_message(&plaintext, &mut ciphertext)
+            .map_err(|error| SyncError::Noise(error.to_string()))?;
+        ciphertext.truncate(length);
+        socket
+            .send(Message::Binary(ciphertext.into()))
             .await
-            .map_err(|error| SyncError::Transport(error.to_string())),
-        WireSecurity::Noise(state) => {
-            let chunk_count = serialized.len().div_ceil(MAX_CHUNK_DATA_BYTES).max(1);
-            for (index, chunk) in serialized.chunks(MAX_CHUNK_DATA_BYTES).enumerate() {
-                let flag = if index + 1 == chunk_count {
-                    CHUNK_FINAL
-                } else {
-                    CHUNK_CONTINUES
-                };
-                let mut plaintext = Vec::with_capacity(chunk.len() + 1);
-                plaintext.push(flag);
-                plaintext.extend_from_slice(chunk);
-                let mut ciphertext = vec![0_u8; plaintext.len() + NOISE_TAG_BYTES];
-                let length = state
-                    .write_message(&plaintext, &mut ciphertext)
-                    .map_err(|error| SyncError::Noise(error.to_string()))?;
-                ciphertext.truncate(length);
-                socket
-                    .send(Message::Binary(ciphertext.into()))
-                    .await
-                    .map_err(|error| SyncError::Transport(error.to_string()))?;
-            }
-            // serde_json messages are non-empty. Keep the framing definition
-            // total in case that invariant ever changes.
-            if serialized.is_empty() {
-                let mut ciphertext = vec![0_u8; 1 + NOISE_TAG_BYTES];
-                let length = state
-                    .write_message(&[CHUNK_FINAL], &mut ciphertext)
-                    .map_err(|error| SyncError::Noise(error.to_string()))?;
-                ciphertext.truncate(length);
-                socket
-                    .send(Message::Binary(ciphertext.into()))
-                    .await
-                    .map_err(|error| SyncError::Transport(error.to_string()))?;
-            }
-            Ok(())
-        }
+            .map_err(|error| SyncError::Transport(error.to_string()))?;
     }
+    if serialized.is_empty() {
+        let mut ciphertext = vec![0_u8; 1 + NOISE_TAG_BYTES];
+        let length = security
+            .write_message(&[CHUNK_FINAL], &mut ciphertext)
+            .map_err(|error| SyncError::Noise(error.to_string()))?;
+        ciphertext.truncate(length);
+        socket
+            .send(Message::Binary(ciphertext.into()))
+            .await
+            .map_err(|error| SyncError::Transport(error.to_string()))?;
+    }
+    Ok(())
 }
 
 async fn receive_json<S>(
     socket: &mut S,
-    security: &mut WireSecurity,
+    security: &mut snow::TransportState,
     max_content_size: u64,
 ) -> Result<ServerMessage, SyncError>
 where
@@ -799,21 +819,12 @@ where
     loop {
         let message = socket.next().await.ok_or(SyncError::Disconnected)??;
         match message {
-            Message::Text(text) if matches!(security, WireSecurity::Plain) => {
-                if text.len() > maximum {
-                    return Err(SyncError::Protocol("server frame exceeds local limit"));
-                }
-                return Ok(serde_json::from_str(&text)?);
-            }
-            Message::Binary(ciphertext) if matches!(security, WireSecurity::Noise(_)) => {
+            Message::Binary(ciphertext) => {
                 if ciphertext.is_empty() || ciphertext.len() > NOISE_MAX_CIPHERTEXT_BYTES {
                     return Err(SyncError::Protocol("invalid encrypted transport frame"));
                 }
-                let WireSecurity::Noise(state) = security else {
-                    unreachable!()
-                };
                 let mut plaintext = vec![0_u8; ciphertext.len()];
-                let length = state
+                let length = security
                     .read_message(&ciphertext, &mut plaintext)
                     .map_err(|_| SyncError::Authentication)?;
                 plaintext.truncate(length);
@@ -864,18 +875,20 @@ fn jittered(delay: Duration, maximum: Duration) -> Duration {
     delay.mul_f64(percent as f64 / 100.0).min(maximum)
 }
 
-fn read_authentication(configuration: &ResolvedSyncConfig) -> Result<Authentication, SyncError> {
-    match fs::symlink_metadata(&configuration.pairing_path) {
-        Ok(_) => {
-            let credential = read_pairing(&configuration.pairing_path)?;
-            let psk = pairing_psk(&credential)?;
-            Ok(Authentication::Noise { credential, psk })
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Authentication::LegacyBearer(
-            read_token(&configuration.token_path)?,
-        )),
-        Err(error) => Err(error.into()),
+fn validate_relay_url(relay_url: &str) -> Result<(), SyncError> {
+    let parsed =
+        url::Url::parse(relay_url).map_err(|_| SyncError::SetupCode("invalid relay URL"))?;
+    if !matches!(parsed.scheme(), "ws" | "wss")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/sync/v1"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(SyncError::SetupCode("invalid relay URL"));
     }
+    Ok(())
 }
 
 fn pairing_psk(credential: &PairingCredential) -> Result<[u8; 32], SyncError> {
@@ -911,17 +924,8 @@ pub fn read_pairing(path: &Path) -> Result<PairingCredential, SyncError> {
     Ok(credential)
 }
 
-pub fn write_pairing_code(path: &Path, code: &str) -> Result<(), SyncError> {
-    let parts: Vec<&str> = code.trim().split(':').collect();
-    if parts.len() != 3 || parts[0] != PAIRING_CODE_PREFIX {
-        return Err(SyncError::Credentials("invalid pairing code".into()));
-    }
-    let credential = PairingCredential {
-        version: 1,
-        pairing_id: parts[1].to_owned(),
-        pairing_secret: parts[2].to_owned(),
-    };
-    pairing_psk(&credential).map_err(|_| SyncError::Credentials("invalid pairing code".into()))?;
+pub fn write_pairing(path: &Path, credential: &PairingCredential) -> Result<(), SyncError> {
+    pairing_psk(credential)?;
     let bytes = serde_json::to_vec_pretty(&credential)?;
     atomic_write_secret(path, &bytes).map_err(|error| SyncError::Credentials(error.to_string()))
 }
@@ -934,136 +938,10 @@ pub fn remove_pairing(path: &Path) -> Result<bool, SyncError> {
     }
 }
 
-pub fn read_token(path: &Path) -> Result<TokenFile, SyncError> {
-    kclip_crypto::validate_secret_file(path)
-        .map_err(|error| SyncError::Credentials(error.to_string()))?;
-    if fs::metadata(path)?.len() > 64 * 1024 {
-        return Err(SyncError::Credentials(
-            "access token file is too large".into(),
-        ));
-    }
-    let token: TokenFile = serde_json::from_slice(&fs::read(path)?)?;
-    if token.access_token.trim().is_empty() || token.access_token.len() > 32 * 1024 {
-        return Err(SyncError::Credentials(
-            "access token is empty or too large".into(),
-        ));
-    }
-    Ok(token)
-}
-
-pub fn write_token(path: &Path, access_token: &str) -> Result<(), SyncError> {
-    if access_token.trim().is_empty() || access_token.len() > 32 * 1024 {
-        return Err(SyncError::Credentials(
-            "access token is empty or too large".into(),
-        ));
-    }
-    let bytes = serde_json::to_vec_pretty(&TokenFile {
-        access_token: access_token.into(),
-    })?;
-    atomic_write_secret(path, &bytes).map_err(|error| SyncError::Credentials(error.to_string()))
-}
-
-pub fn remove_token(path: &Path) -> Result<bool, SyncError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AuthClient {
-    base_url: String,
-    token_path: PathBuf,
-    client: reqwest::Client,
-}
-
-impl AuthClient {
-    pub fn from_relay(relay_url: &str, token_path: PathBuf) -> Result<Self, SyncError> {
-        let mut base_url = if let Some(rest) = relay_url.strip_prefix("wss://") {
-            format!("https://{rest}")
-        } else {
-            return Err(SyncError::Protocol(
-                "password and bearer authentication requires wss://",
-            ));
-        };
-        if let Some(stripped) = base_url.strip_suffix("/sync/v1") {
-            base_url = stripped.to_owned();
-        }
-        Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            token_path,
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()?,
-        })
-    }
-
-    pub async fn register(
-        &self,
-        username: &str,
-        email: &str,
-        password: &str,
-    ) -> Result<(), SyncError> {
-        #[derive(Serialize)]
-        struct Registration<'a> {
-            username: &'a str,
-            email: &'a str,
-            password: &'a str,
-        }
-        let response = self
-            .client
-            .post(format!("{}/register", self.base_url))
-            .json(&Registration {
-                username,
-                email,
-                password,
-            })
-            .send()
-            .await?;
-        self.save_response_token(response).await
-    }
-
-    pub async fn login(&self, username: &str, password: &str) -> Result<(), SyncError> {
-        let response = self
-            .client
-            .post(format!("{}/login", self.base_url))
-            .form(&[("username", username), ("password", password)])
-            .send()
-            .await?;
-        self.save_response_token(response).await
-    }
-
-    pub async fn logout(&self) -> Result<(), SyncError> {
-        let token = read_token(&self.token_path)?;
-        let response = self
-            .client
-            .post(format!("{}/logout", self.base_url))
-            .bearer_auth(&token.access_token)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(SyncError::Authentication);
-        }
-        remove_token(&self.token_path)?;
-        Ok(())
-    }
-
-    async fn save_response_token(&self, response: reqwest::Response) -> Result<(), SyncError> {
-        if !response.status().is_success() {
-            return Err(if response.status().as_u16() == 401 {
-                SyncError::Authentication
-            } else {
-                SyncError::Server(format!("http_{}", response.status().as_u16()))
-            });
-        }
-        let token: TokenFile = response.json().await?;
-        write_token(&self.token_path, &token.access_token)
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum SyncError {
+    #[error("invalid device setup code: {0}")]
+    SetupCode(&'static str),
     #[error("synchronization credentials unavailable: {0}")]
     Credentials(String),
     #[error("server authentication failed")]
@@ -1084,8 +962,6 @@ pub enum SyncError {
     Json(#[from] serde_json::Error),
     #[error("WebSocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
     #[error("credential I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("invalid HTTP header")]
@@ -1097,26 +973,25 @@ pub enum SyncError {
 impl SyncError {
     pub fn category(&self) -> &'static str {
         match self {
+            Self::SetupCode(_) => "setup_code",
             Self::Credentials(_) => "credentials",
             Self::Authentication => "authentication",
             Self::Protocol(_) | Self::Json(_) | Self::Header(_) | Self::Noise(_) => "protocol",
             Self::Server(_) => "server",
-            Self::Transport(_) | Self::Disconnected | Self::WebSocket(_) | Self::Http(_) => {
-                "connectivity"
-            }
+            Self::Transport(_) | Self::Disconnected | Self::WebSocket(_) => "connectivity",
             Self::Storage(_) | Self::Io(_) => "storage",
             Self::Crypto(_) => "cryptography",
         }
     }
 
     fn is_permanent_event_error(&self) -> bool {
-        matches!(self, Self::Crypto(_) | Self::Protocol(_) | Self::Json(_))
-            || matches!(
-                self,
-                Self::Storage(
-                    StorageError::IdentityConflict(_) | StorageError::ContentTooLarge { .. }
-                )
-            )
+        matches!(
+            self,
+            Self::Crypto(_) | Self::Protocol(_) | Self::Json(_) | Self::SetupCode(_)
+        ) || matches!(
+            self,
+            Self::Storage(StorageError::IdentityConflict(_) | StorageError::ContentTooLarge { .. })
+        )
     }
 }
 
@@ -1227,25 +1102,27 @@ mod tests {
     }
 
     #[test]
-    fn pairing_codes_round_trip_into_private_credential_files() {
+    fn server_setup_fixture_decodes_and_writes_a_private_credential() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("private/pairing.json");
         let pairing_id = "eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5";
-        let psk = [29_u8; 32];
-        write_pairing_code(
-            &path,
-            &format!(
-                "{PAIRING_CODE_PREFIX}:{pairing_id}:{}",
-                URL_SAFE_NO_PAD.encode(psk)
-            ),
-        )
-        .unwrap();
+        let setup =
+            DeviceSetupCodeV1::parse(include_str!("../../../fixtures/kclip-setup-v1.txt").trim())
+                .unwrap();
+        assert_eq!(setup.relay_url, "wss://clipboard.example.test/sync/v1");
+        assert_eq!(setup.username, "alice");
+        assert_eq!(setup.device_name, "office-laptop");
+        assert_eq!(setup.pairing_id(), pairing_id);
+        write_pairing(&path, &setup.pairing_credential()).unwrap();
         let credential = read_pairing(&path).unwrap();
         assert_eq!(credential.version, 1);
         assert_eq!(credential.pairing_id, pairing_id);
-        assert_eq!(pairing_psk(&credential).unwrap(), psk);
+        assert_eq!(
+            pairing_psk(&credential).unwrap(),
+            std::array::from_fn(|index| index as u8)
+        );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1255,16 +1132,89 @@ mod tests {
     }
 
     #[test]
-    fn pairing_codes_reject_wrong_length_and_noncanonical_ids() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("pairing.json");
+    fn setup_codes_reject_bad_outer_encodings_and_payloads() {
+        let fixture = include_str!("../../../fixtures/kclip-setup-v1.txt").trim();
         for code in [
-            "not-a-pairing-code",
-            "kclip-pair-v1:EB6B89C3-6A6F-45FA-8DA7-B74EA00BBFD5:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "kclip-pair-v1:eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5:AAAA",
+            "not-a-setup-code",
+            "kclip-pair-v1:AAAA",
+            "kclip-setup-v1:++++",
+            &format!("{fixture}="),
+            &format!("{fixture}:extra"),
         ] {
-            assert!(write_pairing_code(&path, code).is_err());
+            assert!(DeviceSetupCodeV1::parse(code).is_err());
         }
+        assert!(
+            DeviceSetupCodeV1::parse(&format!("kclip-setup-v1:{}", "A".repeat(16 * 1024))).is_err()
+        );
+    }
+
+    #[test]
+    fn setup_codes_strictly_validate_json_and_every_field() {
+        fn wrap(payload: &[u8]) -> String {
+            format!("kclip-setup-v1:{}", URL_SAFE_NO_PAD.encode(payload))
+        }
+        fn payload(overrides: &[(&str, serde_json::Value)]) -> serde_json::Value {
+            let mut value = serde_json::json!({
+                "version": 1,
+                "relay_url": "wss://clipboard.example.test/sync/v1",
+                "username": "alice",
+                "device_name": "office-laptop",
+                "pairing_id": "eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5",
+                "pairing_secret": URL_SAFE_NO_PAD.encode([0_u8; 32]),
+            });
+            for (field, replacement) in overrides {
+                value[field] = replacement.clone();
+            }
+            value
+        }
+        fn encoded(value: &serde_json::Value) -> String {
+            wrap(&serde_json::to_vec(value).unwrap())
+        }
+
+        for value in [
+            serde_json::json!([]),
+            payload(&[("version", serde_json::json!(2))]),
+            payload(&[("username", serde_json::json!(""))]),
+            payload(&[("device_name", serde_json::json!(""))]),
+            payload(&[(
+                "relay_url",
+                serde_json::json!("https://example.test/sync/v1"),
+            )]),
+            payload(&[(
+                "relay_url",
+                serde_json::json!("wss://user@example.test/sync/v1"),
+            )]),
+            payload(&[("relay_url", serde_json::json!("wss://example.test/other"))]),
+            payload(&[(
+                "relay_url",
+                serde_json::json!("wss://example.test/sync/v1?q=1"),
+            )]),
+            payload(&[(
+                "relay_url",
+                serde_json::json!("wss://example.test/sync/v1#fragment"),
+            )]),
+            payload(&[(
+                "pairing_id",
+                serde_json::json!("EB6B89C3-6A6F-45FA-8DA7-B74EA00BBFD5"),
+            )]),
+            payload(&[("pairing_secret", serde_json::json!("AAAA"))]),
+            payload(&[(
+                "pairing_secret",
+                serde_json::json!(format!("{}=", URL_SAFE_NO_PAD.encode([0_u8; 32]))),
+            )]),
+        ] {
+            assert!(DeviceSetupCodeV1::parse(&encoded(&value)).is_err());
+        }
+
+        let mut unknown = payload(&[]);
+        unknown["future"] = serde_json::json!(true);
+        assert!(DeviceSetupCodeV1::parse(&encoded(&unknown)).is_err());
+        let mut missing = payload(&[]);
+        missing.as_object_mut().unwrap().remove("username");
+        assert!(DeviceSetupCodeV1::parse(&encoded(&missing)).is_err());
+        let duplicate = br#"{"version":1,"version":1,"relay_url":"wss://clipboard.example.test/sync/v1","username":"alice","device_name":"office-laptop","pairing_id":"eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5","pairing_secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
+        assert!(DeviceSetupCodeV1::parse(&wrap(duplicate)).is_err());
+        assert!(DeviceSetupCodeV1::parse(&wrap(&[0xff, 0xfe])).is_err());
     }
 
     #[tokio::test]
@@ -1412,14 +1362,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_base_url_is_derived_without_weakening_tls() {
-        let client =
-            AuthClient::from_relay("wss://clipboard.example/sync/v1", PathBuf::from("token"))
-                .unwrap();
-        assert_eq!(client.base_url, "https://clipboard.example");
-    }
-
-    #[test]
     fn websocket_json_matches_the_cross_repository_wire_fixture() {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../../fixtures/sync-wire-v1.json")).unwrap();
@@ -1527,17 +1469,17 @@ mod tests {
                 },
             )
             .unwrap();
-        let token_path = temp.path().join("config/token.json");
         let pairing_path = temp.path().join("config/pairing.json");
         let key_path = temp.path().join("data/sync.key");
         let pairing_id = "eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5";
         let psk = [17_u8; 32];
-        write_pairing_code(
+        write_pairing(
             &pairing_path,
-            &format!(
-                "{PAIRING_CODE_PREFIX}:{pairing_id}:{}",
-                URL_SAFE_NO_PAD.encode(psk)
-            ),
+            &PairingCredential {
+                version: 1,
+                pairing_id: pairing_id.into(),
+                pairing_secret: URL_SAFE_NO_PAD.encode(psk),
+            },
         )
         .unwrap();
         let key = [23_u8; 32];
@@ -1558,7 +1500,7 @@ mod tests {
                         request.headers().get("x-kclip-pairing-id").unwrap(),
                         pairing_id
                     );
-                    assert!(request.headers().get(AUTHORIZATION).is_none());
+                    assert!(request.headers().get("authorization").is_none());
                     Ok(response)
                 },
             )
@@ -1635,11 +1577,10 @@ mod tests {
                 relay_url: format!("ws://{address}/sync/v1"),
                 reconnect_min_delay: Duration::from_millis(10),
                 reconnect_max_delay: Duration::from_millis(50),
+                account_name: "alice".into(),
                 device_name: "test".into(),
-                token_path,
                 pairing_path,
                 sync_key_path: key_path,
-                allow_insecure_transport: false,
             },
             1024,
         );

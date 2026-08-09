@@ -74,9 +74,10 @@ kclip paste [--slot NAME] [--file PATH]
 kclip list
 kclip clear [--slot NAME] [--local]
 kclip status
-kclip auth register|login|logout|status
-kclip key generate|import|export
-kclip migrate-legacy
+kclip sync setup
+kclip sync status [--json]
+kclip sync recovery-code
+kclip sync disconnect
 ```
 
 Global options:
@@ -103,17 +104,21 @@ never corrupt piped clipboard data.
 
 ## Encrypted synchronization
 
-Synchronization is opt-in. Configure `[sync]` in
-[`config/kclip.toml.example`](config/kclip.toml.example), then create or import
-the account key and enter the one-time per-device code printed by the server:
+Synchronization is opt-in. On the PyPasteServer host, add a device and copy the
+one setup handoff shown by the administrator command. Then run the guided setup
+on the client device:
 
 ```bash
-kclip key generate                 # new account only
-kclip key import                   # existing account: hidden 24-word mnemonic
-kclip auth pair                    # hidden pairing-code prompt
-systemctl --user restart kclipd
-kclip status
+./admin.sh device add              # on the PyPasteServer host
+kclip sync setup                   # on this client; setup code input is hidden
 ```
+
+Setup configures the relay and device label, asks whether this is the first
+device or an additional device, stores the private credential and account key,
+restarts `kclipd`, and does not report success until the daemon authenticates a
+live Noise connection. First-device setup displays 24 recovery words once;
+additional devices enter those same words through hidden input. Use
+`kclip sync status` for an actionable local-and-live checklist.
 
 Use `kclip copy --local` for values that must never enter the durable outbox.
 `[slots.NAME] sync = false` enforces the same policy for a whole slot. A normal
@@ -131,24 +136,14 @@ LAN without sending passwords or bearer tokens. TLS remains recommended for
 Internet exposure because it also hides more metadata and integrates with
 network-edge controls.
 
-The pairing key only protects and authenticates this device's network session.
-The account sync key remains separate and provides end-to-end clipboard
-encryption across devices. Removing the local pairing with `kclip auth logout`
-does not revoke the server copy; revoke its pairing ID with the PyPasteServer
-admin command as well.
-
-Existing PyPasteServer Python credentials can be copied safely into kclip-owned
-paths without printing them:
-
-```bash
-kclip migrate-legacy
-```
-
-This validates both `~/.config/clipboard_app/token.json` and
-`~/.config/clipboard_app/key`, then writes private copies under the kclip XDG
-directories. The Python daemon can be disabled after bidirectional sync has
-been verified. `kclip key export --show` is the only command that prints key
-recovery material and emits an explicit warning.
+The setup credential only protects and authenticates this device's network
+session. The account sync key remains separate and provides end-to-end
+clipboard encryption across devices. `kclip sync disconnect` disables local
+sync and removes the device credential while retaining the account key. It also
+prints the pairing ID and the server-side revocation command; local disconnect
+alone cannot revoke the server copy. `kclip sync recovery-code` is the only
+command that prints recovery material and requires an interactive warning and
+confirmation.
 
 ## Storage and durability
 
@@ -160,7 +155,6 @@ Defaults follow the XDG base-directory specification:
 - Blobs: `$XDG_DATA_HOME/kclip/blobs`
 - Configuration: `$XDG_CONFIG_HOME/kclip/config.toml`, falling back to
   `~/.config/kclip/config.toml`
-- Access token: `$XDG_CONFIG_HOME/kclip/token.json`
 - Noise pairing credential: `$XDG_CONFIG_HOME/kclip/pairing.json`
 - Account sync key: `$XDG_DATA_HOME/kclip/sync.key`
 
@@ -211,7 +205,7 @@ expiration, and synchronization state.
 - `crates/kclip-storage` — SQLite revisions and content-addressed blobs
 - `crates/kclip-config` — XDG paths and validated TOML configuration
 - `crates/kclip-crypto` — canonical CBOR and XChaCha20-Poly1305 envelopes
-- `crates/kclip-sync` — durable WebSocket replay, inbox, outbox, and account API
+- `crates/kclip-sync` — setup-code parsing, Noise authentication, and durable WebSocket replay
 - `packaging/systemd` — hardened headless user service
 - `kernel` — unsupported experimental kernel prototype
 

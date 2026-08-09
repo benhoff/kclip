@@ -404,9 +404,17 @@ async fn offline_relay_never_blocks_local_clipboard_operations() {
     let temp = TempDir::new().unwrap();
     let socket = temp.path().join("runtime/kclipd.sock");
     let data = temp.path().join("data");
-    let token_path = temp.path().join("secrets/token.json");
+    let pairing_path = temp.path().join("secrets/pairing.json");
     let key_path = temp.path().join("secrets/sync.key");
-    kclip_sync::write_token(&token_path, "offline-token").unwrap();
+    kclip_sync::write_pairing(
+        &pairing_path,
+        &kclip_sync::PairingCredential {
+            version: 1,
+            pairing_id: "eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5".into(),
+            pairing_secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        },
+    )
+    .unwrap();
     kclip_crypto::write_sync_key(&key_path, &[3_u8; 32]).unwrap();
     let mut slots = std::collections::BTreeMap::new();
     slots.insert(
@@ -423,13 +431,12 @@ async fn offline_relay_never_blocks_local_clipboard_operations() {
         max_content_size: 1024,
         sync: kclip_config::SyncResolution::Ready(kclip_config::ResolvedSyncConfig {
             relay_url: "ws://127.0.0.1:1/sync/v1".into(),
+            account_name: "alice".into(),
             reconnect_min_delay: Duration::from_millis(10),
             reconnect_max_delay: Duration::from_millis(50),
             device_name: "offline-test".into(),
-            token_path,
-            pairing_path: temp.path().join("config/pairing.json"),
+            pairing_path,
             sync_key_path: key_path,
-            allow_insecure_transport: true,
         }),
         slots,
     };

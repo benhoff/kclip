@@ -8,7 +8,9 @@ async fn main() {
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     if let Err(error) = execute(&cli, &mut input, &mut output).await {
-        if cli.json {
+        if error.already_reported() {
+            // The command already emitted its complete human or JSON result.
+        } else if cli.json {
             let value = serde_json::json!({
                 "error": error.to_string(),
                 "exit_code": error.exit_code(),

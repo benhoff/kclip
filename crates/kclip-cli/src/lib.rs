@@ -1,25 +1,25 @@
 use clap::{Parser, Subcommand};
 use kclip_config::{
-    Config, ConfigError, default_pairing_path, default_sync_key_path, default_token_path,
+    Config, ConfigError, PreparedSyncConfig, SyncResolution, default_config_path,
+    default_pairing_path, default_sync_key_path, prepare_sync_disconnect, prepare_sync_setup,
 };
-use kclip_crypto::{
-    atomic_write_secret, generate_sync_key, import_legacy_key, key_from_mnemonic, mnemonic_for_key,
-    read_sync_key, write_sync_key,
-};
+use kclip_crypto::{key_from_mnemonic, mnemonic_for_key, read_sync_key, write_sync_key};
 use kclip_protocol::{
-    DEFAULT_SLOT, ErrorCode, FrameError, MAX_FRAME_SIZE, Operation, PROTOCOL_VERSION,
+    DEFAULT_SLOT, DaemonStatus, ErrorCode, FrameError, MAX_FRAME_SIZE, Operation, PROTOCOL_VERSION,
     ProtocolError, Request, Response, ResponsePayload, ResponseResult, RevisionMetadata,
     read_frame, write_frame,
 };
 use kclip_sync::{
-    AuthClient, SyncError, TokenFile, read_pairing, read_token, remove_pairing, remove_token,
-    write_pairing_code, write_token,
+    DeviceSetupCodeV1, PairingCredential, SyncError, read_pairing, remove_pairing, write_pairing,
 };
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    future::Future,
+    io::{self, IsTerminal, Read, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    pin::Pin,
+    process::Command as ProcessCommand,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -96,72 +96,123 @@ pub enum Command {
     /// Show local daemon and synchronization health without exposing secrets.
     Status,
 
-    /// Manage the PyPasteServer device credential.
-    Auth {
+    /// Configure and inspect encrypted PyPasteServer synchronization.
+    Sync {
         #[command(subcommand)]
-        command: AuthCommand,
-    },
-
-    /// Manage the shared 32-byte account synchronization key.
-    Key {
-        #[command(subcommand)]
-        command: KeyCommand,
-    },
-
-    /// Import the legacy Python client's token and key into kclip-owned paths.
-    MigrateLegacy {
-        #[arg(long)]
-        token_file: Option<PathBuf>,
-        #[arg(long)]
-        key_file: Option<PathBuf>,
+        command: SyncCommand,
     },
 }
 
 #[derive(Debug, Clone, Subcommand)]
-pub enum AuthCommand {
-    /// Store a one-time pairing code entered through hidden input.
-    Pair,
-    Register {
-        #[arg(long)]
-        username: Option<String>,
-        #[arg(long)]
-        email: Option<String>,
-    },
-    Login {
-        #[arg(long)]
-        username: Option<String>,
-    },
-    Logout {
-        /// Remove the local token without contacting the server.
-        #[arg(long)]
-        local: bool,
-    },
+pub enum SyncCommand {
+    /// Configure this device from one hidden server-generated setup code.
+    Setup,
+    /// Show an actionable local and live synchronization checklist.
     Status,
+    /// Print the account recovery words after an interactive warning.
+    RecoveryCode,
+    /// Disable synchronization and remove only this device's local credential.
+    Disconnect,
 }
 
-#[derive(Debug, Clone, Subcommand)]
-pub enum KeyCommand {
-    Generate {
-        /// Replace an existing key. This disconnects the device from old ciphertext.
-        #[arg(long)]
-        force: bool,
-    },
-    Import {
-        /// File containing a raw 32-byte key. Omit to enter a 24-word mnemonic securely.
-        #[arg(long)]
-        file: Option<PathBuf>,
-    },
-    Export {
-        /// Required acknowledgement that the recovery mnemonic will be printed.
-        #[arg(long)]
-        show: bool,
-    },
+pub trait SecretInput {
+    fn is_interactive(&self) -> bool;
+    fn read_hidden(&mut self, prompt: &str) -> io::Result<String>;
+}
+
+struct TerminalSecretInput;
+
+impl SecretInput for TerminalSecretInput {
+    fn is_interactive(&self) -> bool {
+        io::stdin().is_terminal() && io::stdout().is_terminal()
+    }
+
+    fn read_hidden(&mut self, prompt: &str) -> io::Result<String> {
+        rpassword::prompt_password(prompt)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartOutcome {
+    Restarted,
+    ManualRestartRequired,
+}
+
+pub trait SetupRuntime {
+    fn restart_daemon(&mut self) -> Result<RestartOutcome, CliError>;
+
+    fn daemon_status<'a>(
+        &'a mut self,
+        socket: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Option<DaemonStatus>> + 'a>>;
+
+    fn delay<'a>(
+        &'a mut self,
+        duration: std::time::Duration,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>>;
+
+    fn verification_attempts(&self) -> usize {
+        80
+    }
+}
+
+struct SystemSetupRuntime;
+
+impl SetupRuntime for SystemSetupRuntime {
+    fn restart_daemon(&mut self) -> Result<RestartOutcome, CliError> {
+        restart_installed_daemon()
+    }
+
+    fn daemon_status<'a>(
+        &'a mut self,
+        socket: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Option<DaemonStatus>> + 'a>> {
+        Box::pin(async move {
+            match send_request(socket, Operation::Status).await {
+                Ok(ResponsePayload::Status(status)) => Some(status),
+                Ok(_) | Err(_) => None,
+            }
+        })
+    }
+
+    fn delay<'a>(
+        &'a mut self,
+        duration: std::time::Duration,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(tokio::time::sleep(duration))
+    }
 }
 
 pub async fn execute(
     cli: &Cli,
     input: &mut dyn Read,
     output: &mut dyn Write,
+) -> Result<(), CliError> {
+    execute_with_runtime(
+        cli,
+        input,
+        output,
+        &mut TerminalSecretInput,
+        &mut SystemSetupRuntime,
+    )
+    .await
+}
+
+pub async fn execute_with_secret_input(
+    cli: &Cli,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    secrets: &mut dyn SecretInput,
+) -> Result<(), CliError> {
+    execute_with_runtime(cli, input, output, secrets, &mut SystemSetupRuntime).await
+}
+
+pub async fn execute_with_runtime(
+    cli: &Cli,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    secrets: &mut dyn SecretInput,
+    runtime: &mut dyn SetupRuntime,
 ) -> Result<(), CliError> {
     match &cli.command {
         Command::Copy {
@@ -265,14 +316,12 @@ pub async fn execute(
                 }
             }
         }
-        Command::Auth { command } => {
-            execute_auth(command, input, output, cli.json).await?;
-        }
-        Command::Key { command } => execute_key(command, input, output, cli.json)?,
-        Command::MigrateLegacy {
-            token_file,
-            key_file,
-        } => migrate_legacy(token_file.as_deref(), key_file.as_deref(), output, cli.json)?,
+        Command::Sync { command } => match command {
+            SyncCommand::Setup => execute_sync_setup(cli, input, output, secrets, runtime).await?,
+            SyncCommand::Status => execute_sync_status(cli, output).await?,
+            SyncCommand::RecoveryCode => execute_recovery_code(cli, input, output, secrets)?,
+            SyncCommand::Disconnect => execute_sync_disconnect(cli, output, runtime).await?,
+        },
     }
     Ok(())
 }
@@ -284,310 +333,800 @@ fn local_socket(cli: &Cli) -> Result<PathBuf, CliError> {
     }
 }
 
-async fn execute_auth(
-    command: &AuthCommand,
+async fn execute_sync_setup(
+    cli: &Cli,
     input: &mut dyn Read,
     output: &mut dyn Write,
-    json: bool,
+    secrets: &mut dyn SecretInput,
+    runtime: &mut dyn SetupRuntime,
 ) -> Result<(), CliError> {
-    let config = Config::load(None)?;
-    let token_path = config
+    if cli.json {
+        return Err(CliError::Usage(
+            "sync setup does not support --json because it is interactive".into(),
+        ));
+    }
+    if !secrets.is_interactive() {
+        return Err(CliError::Usage(
+            "sync setup requires an interactive terminal".into(),
+        ));
+    }
+
+    let config_path = default_config_path()?;
+    let config = load_optional_config(&config_path)?;
+    let raw_code = secrets.read_hidden("Client setup code: ")?;
+    let setup = DeviceSetupCodeV1::parse(&raw_code)?;
+    drop(raw_code);
+
+    let configured_account = config
         .sync
-        .token_path
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(default_token_path)?;
+        .account_name
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let configured_relay = config
+        .sync
+        .relay_url
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let has_account_metadata = config.sync.enabled || configured_account.is_some();
+    if has_account_metadata
+        && (configured_relay.is_some_and(|value| value != setup.relay_url)
+            || configured_account.is_some_and(|value| value != setup.username))
+    {
+        return Err(CliError::Usage(
+            "synchronization is already configured for a different relay or account; disconnecting and reconciling existing synchronized data must be done separately"
+                .into(),
+        ));
+    }
+
     let pairing_path = config
         .sync
         .pairing_path
         .clone()
         .map(Ok)
         .unwrap_or_else(default_pairing_path)?;
-    match command {
-        AuthCommand::Status => {
-            let (method, state) = match read_pairing(&pairing_path) {
-                Ok(_) => ("noise_psk", "present"),
-                Err(_) if pairing_path.exists() => ("noise_psk", "invalid_or_unsafe"),
-                Err(_) => match read_token(&token_path) {
-                    Ok(_) => ("legacy_bearer", "present"),
-                    Err(_) if token_path.exists() => ("legacy_bearer", "invalid_or_unsafe"),
-                    Err(_) => ("none", "missing"),
-                },
-            };
-            if json {
-                write_json(
-                    output,
-                    &serde_json::json!({
-                        "authenticated": state == "present",
-                        "method": method,
-                        "state": state
-                    }),
-                )?;
-            } else {
-                writeln!(output, "authentication: {method} ({state})")?;
-            }
-        }
-        AuthCommand::Pair => {
-            let code = rpassword::prompt_password("Pairing code: ")?;
-            if code.trim().is_empty() {
-                return Err(CliError::Usage("pairing code must not be empty".into()));
-            }
-            write_pairing_code(&pairing_path, &code)?;
-            // Never leave a bearer-token fallback behind after switching this
-            // device to pairing authentication.
-            remove_token(&token_path)?;
-            write_success(output, json, "paired")?;
-        }
-        AuthCommand::Register { username, email } => {
-            let relay = configured_relay(&config)?;
-            let username = prompt_value(username.as_deref(), "Username", input, output)?;
-            let email = prompt_value(email.as_deref(), "Email", input, output)?;
-            let password = rpassword::prompt_password("Password: ")?;
-            let confirmation = rpassword::prompt_password("Confirm password: ")?;
-            if password.is_empty() || password != confirmation {
-                return Err(CliError::Usage(
-                    "passwords are empty or do not match".into(),
-                ));
-            }
-            AuthClient::from_relay(relay, token_path)?
-                .register(&username, &email, &password)
-                .await?;
-            write_success(output, json, "registered")?;
-        }
-        AuthCommand::Login { username } => {
-            let relay = configured_relay(&config)?;
-            let username = prompt_value(username.as_deref(), "Username", input, output)?;
-            let password = rpassword::prompt_password("Password: ")?;
-            if password.is_empty() {
-                return Err(CliError::Usage("password must not be empty".into()));
-            }
-            AuthClient::from_relay(relay, token_path)?
-                .login(&username, &password)
-                .await?;
-            write_success(output, json, "logged_in")?;
-        }
-        AuthCommand::Logout { local } => {
-            if pairing_path.exists() {
-                remove_pairing(&pairing_path)?;
-                remove_token(&token_path)?;
-            } else if *local {
-                remove_token(&token_path)?;
-            } else {
-                let relay = configured_relay(&config)?;
-                AuthClient::from_relay(relay, token_path)?.logout().await?;
-            }
-            write_success(output, json, "logged_out")?;
-        }
-    }
-    Ok(())
-}
-
-fn execute_key(
-    command: &KeyCommand,
-    input: &mut dyn Read,
-    output: &mut dyn Write,
-    json: bool,
-) -> Result<(), CliError> {
-    let config = Config::load(None)?;
-    let path = config
+    let key_path = config
         .security
         .sync_key_path
         .clone()
         .map(Ok)
         .unwrap_or_else(default_sync_key_path)?;
-    match command {
-        KeyCommand::Generate { force } => {
-            if path.exists() && !force {
-                return Err(CliError::Usage(
-                    "a synchronization key already exists; use --force only when intentionally starting a new account key"
-                        .into(),
-                ));
-            }
-            generate_sync_key(&path).map_err(SyncError::from)?;
-            write_success(output, json, "key_generated")?;
-        }
-        KeyCommand::Import { file } => {
-            if let Some(source) = file {
-                import_legacy_key(source, &path).map_err(SyncError::from)?;
-            } else {
-                writeln!(
-                    output,
-                    "Enter the existing 24-word recovery mnemonic (input is hidden):"
-                )?;
-                let words = rpassword::read_password()?;
-                let key = key_from_mnemonic(words.trim()).map_err(SyncError::from)?;
-                write_sync_key(&path, &key).map_err(SyncError::from)?;
-            }
-            write_success(output, json, "key_imported")?;
-        }
-        KeyCommand::Export { show } => {
-            if !show {
-                return Err(CliError::Usage(
-                    "refusing to print recovery material without --show".into(),
-                ));
-            }
-            let key = read_sync_key(&path).map_err(SyncError::from)?;
-            let mnemonic = mnemonic_for_key(&key).map_err(SyncError::from)?;
-            if json {
-                write_json(output, &serde_json::json!({ "mnemonic": mnemonic }))?;
-            } else {
-                writeln!(
-                    output,
-                    "WARNING: anyone with these words can decrypt synchronized clipboard history."
-                )?;
-                writeln!(output, "{mnemonic}")?;
-            }
-        }
-    }
-    let _ = input;
-    Ok(())
-}
-
-fn migrate_legacy(
-    token_source: Option<&Path>,
-    key_source: Option<&Path>,
-    output: &mut dyn Write,
-    json: bool,
-) -> Result<(), CliError> {
-    let config = Config::load(None)?;
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or(ConfigError::MissingHomeDirectory)?;
-    let token_source = token_source
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| home.join(".config/clipboard_app/token.json"));
-    let key_source = key_source
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| home.join(".config/clipboard_app/key"));
-    let token_destination = config
-        .sync
-        .token_path
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(default_token_path)?;
-    let key_destination = config
-        .security
-        .sync_key_path
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(default_sync_key_path)?;
-
-    // The legacy Python client commonly created 0644 files. Validate ownership
-    // and file type, then copy into private kclip-owned destinations.
-    let token: TokenFile = serde_json::from_slice(&read_owned_legacy_file(&token_source)?)?;
-    if token.access_token.trim().is_empty() {
-        return Err(CliError::Usage("legacy access token is empty".into()));
-    }
-    let key: [u8; 32] = read_owned_legacy_file(&key_source)?
-        .try_into()
-        .map_err(|_| CliError::Usage("legacy synchronization key is not 32 bytes".into()))?;
-    // Validate both sources before mutating either destination.
-    let token_backup = backup_existing_secret(&token_destination)?;
-    let _key_backup = backup_existing_secret(&key_destination)?;
-    write_token(&token_destination, &token.access_token)?;
-    if let Err(error) = atomic_write_secret(&key_destination, &key) {
-        restore_secret(&token_destination, token_backup.as_deref())?;
-        return Err(SyncError::from(error).into());
-    }
-    write_success(output, json, "legacy_credentials_imported")
-}
-
-fn read_owned_legacy_file(path: &Path) -> Result<Vec<u8>, CliError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.len() > 64 * 1024
+    let existing_pairing = read_optional_pairing(&pairing_path)?;
+    let existing_key = read_optional_sync_key(&key_path)?;
+    if existing_key.is_some()
+        && (configured_relay != Some(setup.relay_url.as_str())
+            || configured_account != Some(setup.username.as_str()))
     {
         return Err(CliError::Usage(
-            "legacy secret must be a regular non-symbolic-link file owned by this user".into(),
+            "an account encryption key already exists, but the configured relay/account metadata does not match this setup code; refusing to guess which account owns the key"
+                .into(),
         ));
     }
-    Ok(fs::read(path)?)
-}
 
-fn backup_existing_secret(path: &Path) -> Result<Option<PathBuf>, CliError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    kclip_crypto::validate_secret_file(path).map_err(SyncError::from)?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| CliError::Usage("secret path has no file name".into()))?;
-    let backup = path.with_file_name(format!("{}.bak.{timestamp}", file_name.to_string_lossy()));
-    if backup.exists() {
-        return Err(CliError::Usage(format!(
-            "refusing to replace existing migration backup {}",
-            backup.display()
-        )));
-    }
-    let bytes = fs::read(path)?;
-    atomic_write_secret(&backup, &bytes).map_err(SyncError::from)?;
-    Ok(Some(backup))
-}
+    let prepared_config = prepare_sync_setup(
+        &config_path,
+        &setup.relay_url,
+        &setup.username,
+        &setup.device_name,
+    )?;
 
-fn restore_secret(path: &Path, backup: Option<&Path>) -> Result<(), CliError> {
-    match backup {
-        Some(backup) => {
-            let bytes = fs::read(backup)?;
-            atomic_write_secret(path, &bytes).map_err(SyncError::from)?;
+    writeln!(output)?;
+    writeln!(output, "Server:  {}", setup.relay_url)?;
+    writeln!(output, "Account: {}", setup.username)?;
+    writeln!(output, "Device:  {}", setup.device_name)?;
+    writeln!(output)?;
+
+    let mut new_key = None;
+    if existing_key.is_none() {
+        writeln!(
+            output,
+            "The setup code authenticates this device. Recovery words provide the shared encryption key used by every device."
+        )?;
+        writeln!(output)?;
+        writeln!(
+            output,
+            "How should this device get the shared encryption key?"
+        )?;
+        writeln!(output, "  1) This is the first device for this account")?;
+        writeln!(output, "  2) Join devices that are already synchronized")?;
+        let choice = read_line_prompt(input, output, "Choice [1-2]: ", 16)?;
+        match choice.as_str() {
+            "1" => {
+                let mut key = [0_u8; 32];
+                getrandom::fill(&mut key)
+                    .map_err(|_| CliError::Usage("secure randomness is unavailable".into()))?;
+                let mnemonic = mnemonic_for_key(&key).map_err(SyncError::from)?;
+                writeln!(output)?;
+                writeln!(
+                    output,
+                    "Recovery words protect access to synchronized clipboard history. Every additional device needs them, and losing every copy loses access to that history."
+                )?;
+                writeln!(
+                    output,
+                    "Store them somewhere private. They will be shown once during setup."
+                )?;
+                writeln!(output)?;
+                writeln!(output, "{mnemonic}")?;
+                writeln!(output)?;
+                let saved = read_line_prompt(
+                    input,
+                    output,
+                    "Have you saved the recovery words? [y/N] ",
+                    16,
+                )?;
+                if !matches!(saved.to_ascii_lowercase().as_str(), "y" | "yes") {
+                    return Err(CliError::Usage(
+                        "setup cancelled before recovery words were confirmed; no files were changed"
+                            .into(),
+                    ));
+                }
+                new_key = Some(key);
+            }
+            "2" => loop {
+                let words = secrets.read_hidden("Existing 24-word recovery mnemonic: ")?;
+                if words.trim().is_empty() {
+                    return Err(CliError::Usage(
+                        "setup cancelled; no files were changed".into(),
+                    ));
+                }
+                match key_from_mnemonic(words.trim()) {
+                    Ok(key) => {
+                        new_key = Some(key);
+                        break;
+                    }
+                    Err(_) => {
+                        writeln!(
+                            output,
+                            "The recovery words are invalid. Try again, or submit an empty value to cancel."
+                        )?;
+                    }
+                }
+            },
+            _ => {
+                return Err(CliError::Usage(
+                    "setup cancelled: choose 1 or 2; no files were changed".into(),
+                ));
+            }
         }
-        None => match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+    }
+
+    let new_pairing = setup.pairing_credential();
+    commit_setup_files(
+        &key_path,
+        new_key.as_ref(),
+        &pairing_path,
+        &new_pairing,
+        existing_pairing.as_ref(),
+        prepared_config,
+    )?;
+
+    writeln!(output)?;
+    writeln!(output, "✓ Device credential stored")?;
+    writeln!(output, "✓ Synchronization configuration updated")?;
+
+    if runtime.restart_daemon()? == RestartOutcome::ManualRestartRequired {
+        writeln!(
+            output,
+            "✗ kclipd was not restarted because the user systemd service is unavailable"
+        )?;
+        writeln!(output, "Restart it manually with: kclipd")?;
+        writeln!(
+            output,
+            "Setup is configured but not connected. Next: run `kclip sync status` after restarting kclipd."
+        )?;
+        show_replaced_pairing_notice(output, existing_pairing.as_ref(), &new_pairing)?;
+        return Err(CliError::Reported(8));
+    }
+    writeln!(output, "✓ kclipd restarted")?;
+
+    let socket = match &cli.socket {
+        Some(path) => path.clone(),
+        None => config.resolve_socket(None)?,
+    };
+    let mut last_status = None;
+    for _ in 0..runtime.verification_attempts() {
+        match runtime.daemon_status(&socket).await {
+            Some(status) if daemon_sync_ready(&status) => {
+                writeln!(output, "✓ Authenticated with PyPasteServer")?;
+                writeln!(output)?;
+                writeln!(output, "Synchronization is ready.")?;
+                show_replaced_pairing_notice(output, existing_pairing.as_ref(), &new_pairing)?;
+                return Ok(());
+            }
+            Some(status) => last_status = Some(status),
+            None => {}
+        }
+        runtime.delay(std::time::Duration::from_millis(250)).await;
+    }
+
+    writeln!(
+        output,
+        "✗ PyPasteServer authentication was not verified within 20 seconds"
+    )?;
+    writeln!(
+        output,
+        "{}",
+        setup_timeout_action(last_status.as_ref(), &setup.relay_url)
+    )?;
+    writeln!(
+        output,
+        "Setup is configured but not connected. Next: run `kclip sync status`."
+    )?;
+    show_replaced_pairing_notice(output, existing_pairing.as_ref(), &new_pairing)?;
+    Err(CliError::Reported(8))
+}
+
+#[derive(serde::Serialize)]
+struct SyncStatusReport {
+    healthy: bool,
+    state: String,
+    configuration: String,
+    enabled: bool,
+    relay_url: Option<String>,
+    account_name: Option<String>,
+    device_name: Option<String>,
+    device_credential: String,
+    account_encryption_key: String,
+    daemon: String,
+    server_connection: String,
+    authenticated: bool,
+    last_successful_connection: Option<i64>,
+    pending_outbox_count: u64,
+    processed_server_cursor: u64,
+    quarantined_event_count: u64,
+    last_error_category: Option<String>,
+    next_action: Option<String>,
+}
+
+async fn execute_sync_status(cli: &Cli, output: &mut dyn Write) -> Result<(), CliError> {
+    let config_path = default_config_path()?;
+    let config = match load_optional_config(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            write_invalid_sync_status(output, cli.json, &config_path, &error.to_string())?;
+            return Err(CliError::Reported(2));
+        }
+    };
+    let invalid_configuration = config
+        .validate_phase_one()
+        .err()
+        .map(|error| error.to_string())
+        .or_else(|| match config.sync_resolution() {
+            SyncResolution::Invalid(message) => Some(message),
+            SyncResolution::Disabled | SyncResolution::Ready(_) => None,
+        });
+    if let Some(message) = invalid_configuration {
+        write_invalid_sync_status(output, cli.json, &config_path, &message)?;
+        return Err(CliError::Reported(2));
+    }
+    let pairing_path = config
+        .sync
+        .pairing_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_pairing_path)?;
+    let key_path = config
+        .security
+        .sync_key_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_sync_key_path)?;
+    let credential_state = local_pairing_state(&pairing_path);
+    let key_state = local_key_state(&key_path);
+
+    let daemon_status = match &cli.socket {
+        Some(socket) => send_request(socket, Operation::Status).await.ok(),
+        None => match config.resolve_socket(None) {
+            Ok(socket) => send_request(&socket, Operation::Status).await.ok(),
+            Err(_) => None,
         },
+    };
+    let daemon = daemon_status.and_then(|payload| match payload {
+        ResponsePayload::Status(status) => Some(status),
+        _ => None,
+    });
+    let healthy = config.sync.enabled
+        && credential_state == "present"
+        && key_state == "present"
+        && daemon.as_ref().is_some_and(daemon_sync_ready);
+    let next_action = sync_next_action(&config, credential_state, key_state, daemon.as_ref());
+    let report = SyncStatusReport {
+        healthy,
+        state: if healthy {
+            "ready".into()
+        } else if !config.sync.enabled || credential_state != "present" || key_state != "present" {
+            "setup_incomplete".into()
+        } else {
+            "unhealthy".into()
+        },
+        configuration: if config.sync.enabled {
+            "enabled".into()
+        } else {
+            "disabled".into()
+        },
+        enabled: config.sync.enabled,
+        relay_url: config.sync.relay_url.clone(),
+        account_name: config.sync.account_name.clone(),
+        device_name: config.sync.device_name.clone(),
+        device_credential: credential_state.into(),
+        account_encryption_key: key_state.into(),
+        daemon: if daemon.is_some() {
+            "running".into()
+        } else {
+            "unavailable".into()
+        },
+        server_connection: daemon
+            .as_ref()
+            .map(|status| status.synchronization_state.clone())
+            .unwrap_or_else(|| "not checked".into()),
+        authenticated: daemon.as_ref().is_some_and(|status| status.authenticated),
+        last_successful_connection: daemon
+            .as_ref()
+            .and_then(|status| status.last_successful_connection),
+        pending_outbox_count: daemon
+            .as_ref()
+            .map_or(0, |status| status.pending_outbox_count),
+        processed_server_cursor: daemon
+            .as_ref()
+            .map_or(0, |status| status.processed_server_cursor),
+        quarantined_event_count: daemon
+            .as_ref()
+            .map_or(0, |status| status.quarantined_event_count),
+        last_error_category: daemon
+            .as_ref()
+            .and_then(|status| status.last_sync_error_category.clone()),
+        next_action,
+    };
+    write_sync_status(output, cli.json, &report)?;
+    if healthy {
+        Ok(())
+    } else {
+        Err(CliError::Reported(8))
+    }
+}
+
+fn execute_recovery_code(
+    cli: &Cli,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    secrets: &mut dyn SecretInput,
+) -> Result<(), CliError> {
+    if cli.json {
+        return Err(CliError::Usage(
+            "sync recovery-code never supports --json".into(),
+        ));
+    }
+    if !secrets.is_interactive() {
+        return Err(CliError::Usage(
+            "sync recovery-code requires an interactive terminal".into(),
+        ));
+    }
+    let config_path = default_config_path()?;
+    let config = load_optional_config(&config_path)?;
+    let key_path = config
+        .security
+        .sync_key_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_sync_key_path)?;
+    let key = read_sync_key(&key_path).map_err(SyncError::from)?;
+    writeln!(
+        output,
+        "WARNING: anyone with these recovery words can decrypt synchronized clipboard history."
+    )?;
+    let confirmed = read_line_prompt(input, output, "Show the recovery words? [y/N] ", 16)?;
+    if !matches!(confirmed.to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Err(CliError::Usage("recovery-code cancelled".into()));
+    }
+    let mnemonic = mnemonic_for_key(&key).map_err(SyncError::from)?;
+    writeln!(output, "{mnemonic}")?;
+    Ok(())
+}
+
+async fn execute_sync_disconnect(
+    cli: &Cli,
+    output: &mut dyn Write,
+    runtime: &mut dyn SetupRuntime,
+) -> Result<(), CliError> {
+    if cli.json {
+        return Err(CliError::Usage(
+            "sync disconnect does not support --json".into(),
+        ));
+    }
+    let config_path = default_config_path()?;
+    let config = load_optional_config(&config_path)?;
+    let pairing_path = config
+        .sync
+        .pairing_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_pairing_path)?;
+    let pairing = read_optional_pairing(&pairing_path)?;
+    let prepared = prepare_sync_disconnect(&config_path)?;
+
+    writeln!(
+        output,
+        "This disables synchronization locally; it does not revoke the server credential."
+    )?;
+    if let Some(pairing) = &pairing {
+        writeln!(output, "Pairing ID: {}", pairing.pairing_id)?;
+        writeln!(
+            output,
+            "On the PyPasteServer host, run: ./admin.sh device revoke {}",
+            pairing.pairing_id
+        )?;
+    }
+    prepared.commit()?;
+    remove_pairing(&pairing_path)?;
+    writeln!(output, "✓ Synchronization disabled")?;
+    writeln!(output, "✓ Local device credential removed")?;
+    writeln!(output, "✓ Account encryption key retained")?;
+    if runtime.restart_daemon()? == RestartOutcome::Restarted {
+        writeln!(output, "✓ kclipd restarted")?;
+        Ok(())
+    } else {
+        writeln!(output, "Restart the manually managed daemon with: kclipd")?;
+        Err(CliError::Reported(8))
+    }
+}
+
+fn load_optional_config(path: &Path) -> Result<Config, CliError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Ok(Config::load(Some(path))?)
+        }
+        Ok(_) => Err(ConfigError::UnsafeFile(path.to_path_buf()).into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(error) => Err(ConfigError::Read {
+            path: path.to_path_buf(),
+            source: error,
+        }
+        .into()),
+    }
+}
+
+fn read_optional_pairing(path: &Path) -> Result<Option<PairingCredential>, CliError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(Some(read_pairing(path)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_optional_sync_key(path: &Path) -> Result<Option<[u8; 32]>, CliError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(Some(read_sync_key(path).map_err(SyncError::from)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn restore_pairing(path: &Path, previous: Option<&PairingCredential>) -> Result<(), CliError> {
+    match previous {
+        Some(credential) => write_pairing(path, credential)?,
+        None => {
+            remove_pairing(path)?;
+        }
     }
     Ok(())
 }
 
-fn configured_relay(config: &Config) -> Result<&str, CliError> {
-    config
-        .sync
-        .relay_url
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| CliError::Usage("sync.relay_url must be configured first".into()))
+fn commit_setup_files(
+    key_path: &Path,
+    new_key: Option<&[u8; 32]>,
+    pairing_path: &Path,
+    new_pairing: &PairingCredential,
+    previous_pairing: Option<&PairingCredential>,
+    prepared_config: PreparedSyncConfig,
+) -> Result<(), CliError> {
+    if let Some(key) = new_key {
+        write_sync_key(key_path, key).map_err(SyncError::from)?;
+    }
+    if let Err(error) = write_pairing(pairing_path, new_pairing) {
+        if new_key.is_some() {
+            fs::remove_file(key_path)?;
+        }
+        return Err(error.into());
+    }
+    if let Err(error) = prepared_config.commit() {
+        let pairing_rollback = restore_pairing(pairing_path, previous_pairing);
+        let key_rollback = if new_key.is_some() {
+            fs::remove_file(key_path).map_err(CliError::from)
+        } else {
+            Ok(())
+        };
+        if pairing_rollback.is_err() || key_rollback.is_err() {
+            return Err(CliError::Usage(
+                "the configuration update failed and local credential rollback was incomplete; synchronization was not enabled"
+                    .into(),
+            ));
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
-fn prompt_value(
-    configured: Option<&str>,
-    label: &str,
+fn read_line_prompt(
     input: &mut dyn Read,
     output: &mut dyn Write,
+    prompt: &str,
+    maximum: usize,
 ) -> Result<String, CliError> {
-    if let Some(value) = configured.filter(|value| !value.trim().is_empty()) {
-        return Ok(value.to_owned());
-    }
-    write!(output, "{label}: ")?;
+    write!(output, "{prompt}")?;
     output.flush()?;
     let mut bytes = Vec::new();
     let mut byte = [0_u8; 1];
     while input.read(&mut byte)? == 1 && byte[0] != b'\n' {
-        bytes.push(byte[0]);
+        if bytes.len() == maximum {
+            return Err(CliError::Usage("interactive response is too long".into()));
+        }
+        if byte[0] != b'\r' {
+            bytes.push(byte[0]);
+        }
     }
-    let value = String::from_utf8(bytes)
-        .map_err(|_| CliError::Usage(format!("{label} must be valid UTF-8")))?;
-    let value = value.trim().to_owned();
-    if value.is_empty() {
-        return Err(CliError::Usage(format!("{label} must not be empty")));
-    }
-    Ok(value)
+    String::from_utf8(bytes)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| CliError::Usage("interactive response must be valid UTF-8".into()))
 }
 
-fn write_success(output: &mut dyn Write, json: bool, action: &str) -> Result<(), CliError> {
-    if json {
-        write_json(
-            output,
-            &serde_json::json!({ "success": true, "action": action }),
-        )
-    } else {
-        writeln!(output, "{action}").map_err(CliError::Io)
+fn restart_installed_daemon() -> Result<RestartOutcome, CliError> {
+    let show = match ProcessCommand::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "kclipd.service",
+            "--property=LoadState",
+            "--value",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RestartOutcome::ManualRestartRequired);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !show.status.success() || String::from_utf8_lossy(&show.stdout).trim() != "loaded" {
+        return Ok(RestartOutcome::ManualRestartRequired);
     }
+    let restart = ProcessCommand::new("systemctl")
+        .args(["--user", "restart", "kclipd.service"])
+        .status()?;
+    if !restart.success() {
+        return Err(CliError::Usage(
+            "local synchronization changes were saved, but `systemctl --user restart kclipd.service` failed; inspect `journalctl --user -u kclipd.service`"
+                .into(),
+        ));
+    }
+    Ok(RestartOutcome::Restarted)
+}
+
+fn daemon_sync_ready(status: &DaemonStatus) -> bool {
+    status.synchronization_enabled
+        && status.synchronization_configured
+        && status.synchronization_state == "connected"
+        && status.authenticated
+        && !status.credential_error
+}
+
+fn setup_timeout_action(status: Option<&DaemonStatus>, relay_url: &str) -> String {
+    match status {
+        None => "The daemon socket is unavailable. Inspect `systemctl --user status kclipd.service`.".into(),
+        Some(status) if status.credential_error || status.last_sync_error_category.as_deref() == Some("authentication") => {
+            "The device credential was rejected. Ask the server operator to add this device again.".into()
+        }
+        Some(status) if status.last_sync_error_category.as_deref() == Some("cryptography") => {
+            "The account key cannot decrypt synchronized data. Run setup with the correct existing recovery words; do not generate a new key.".into()
+        }
+        Some(status) if status.last_sync_error_category.as_deref() == Some("connectivity") => {
+            format!("The relay could not be reached at {relay_url}. Check reachability and TLS configuration.")
+        }
+        Some(_) => "The daemon is still connecting. Inspect `kclip sync status` for the latest cause.".into(),
+    }
+}
+
+fn local_pairing_state(path: &Path) -> &'static str {
+    match fs::symlink_metadata(path) {
+        Ok(_) if read_pairing(path).is_ok() => "present",
+        Ok(_) => "invalid_or_unsafe",
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "missing",
+        Err(_) => "invalid_or_unsafe",
+    }
+}
+
+fn local_key_state(path: &Path) -> &'static str {
+    match fs::symlink_metadata(path) {
+        Ok(_) if read_sync_key(path).is_ok() => "present",
+        Ok(_) => "invalid_or_unsafe",
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "missing",
+        Err(_) => "invalid_or_unsafe",
+    }
+}
+
+fn sync_next_action(
+    config: &Config,
+    credential_state: &str,
+    key_state: &str,
+    daemon: Option<&DaemonStatus>,
+) -> Option<String> {
+    if !config.sync.enabled {
+        return Some("Run `kclip sync setup`.".into());
+    }
+    if credential_state != "present" {
+        return Some("Run `kclip sync setup` again; bearer authentication is not used.".into());
+    }
+    if key_state != "present" {
+        return Some(
+            "Run `kclip sync setup` and choose the correct first/additional-device option.".into(),
+        );
+    }
+    let Some(status) = daemon else {
+        return Some("Start or inspect `kclipd.service`.".into());
+    };
+    if status.quarantined_event_count > 0
+        || status.last_sync_error_category.as_deref() == Some("cryptography")
+    {
+        return Some(
+            "Import the correct account recovery words; do not generate a new key.".into(),
+        );
+    }
+    if status.credential_error
+        || status.last_sync_error_category.as_deref() == Some("authentication")
+    {
+        return Some("Ask the server operator to add this device again, then rerun setup.".into());
+    }
+    if status.last_sync_error_category.as_deref() == Some("connectivity") {
+        return Some("Check relay reachability and TLS configuration.".into());
+    }
+    if !daemon_sync_ready(status) {
+        return Some(
+            "Inspect `systemctl --user status kclipd.service` and retry `kclip sync status`."
+                .into(),
+        );
+    }
+    None
+}
+
+fn write_sync_status(
+    output: &mut dyn Write,
+    json: bool,
+    report: &SyncStatusReport,
+) -> Result<(), CliError> {
+    if json {
+        return write_json(output, report);
+    }
+    writeln!(
+        output,
+        "Synchronization: {}",
+        report.state.replace('_', " ")
+    )?;
+    writeln!(output)?;
+    checklist(
+        output,
+        report.enabled,
+        "configuration",
+        &report.configuration,
+    )?;
+    checklist(
+        output,
+        report.relay_url.is_some(),
+        "relay",
+        report.relay_url.as_deref().unwrap_or("missing"),
+    )?;
+    checklist(
+        output,
+        report.account_name.is_some(),
+        "account",
+        report.account_name.as_deref().unwrap_or("missing"),
+    )?;
+    checklist(
+        output,
+        report.device_credential == "present",
+        "device credential",
+        &report.device_credential,
+    )?;
+    checklist(
+        output,
+        report.account_encryption_key == "present",
+        "account encryption key",
+        &report.account_encryption_key,
+    )?;
+    checklist(output, report.daemon == "running", "daemon", &report.daemon)?;
+    checklist(
+        output,
+        report.healthy,
+        "server connection",
+        &report.server_connection,
+    )?;
+    if let Some(device) = &report.device_name {
+        writeln!(output, "  device: {device}")?;
+    }
+    if report.daemon == "running" {
+        writeln!(
+            output,
+            "  last successful connection: {}",
+            report
+                .last_successful_connection
+                .map_or_else(|| "never".into(), |value| value.to_string())
+        )?;
+        writeln!(output, "  pending outbox: {}", report.pending_outbox_count)?;
+        writeln!(
+            output,
+            "  server cursor: {}",
+            report.processed_server_cursor
+        )?;
+        writeln!(
+            output,
+            "  quarantined events: {}",
+            report.quarantined_event_count
+        )?;
+    }
+    if let Some(action) = &report.next_action {
+        writeln!(output)?;
+        writeln!(output, "Next: {action}")?;
+    }
+    Ok(())
+}
+
+fn write_invalid_sync_status(
+    output: &mut dyn Write,
+    json: bool,
+    config_path: &Path,
+    message: &str,
+) -> Result<(), CliError> {
+    let report = SyncStatusReport {
+        healthy: false,
+        state: "setup_incomplete".into(),
+        configuration: format!("invalid: {message}"),
+        enabled: false,
+        relay_url: None,
+        account_name: None,
+        device_name: None,
+        device_credential: "unknown".into(),
+        account_encryption_key: "unknown".into(),
+        daemon: "unknown".into(),
+        server_connection: "not checked".into(),
+        authenticated: false,
+        last_successful_connection: None,
+        pending_outbox_count: 0,
+        processed_server_cursor: 0,
+        quarantined_event_count: 0,
+        last_error_category: Some("invalid_configuration".into()),
+        next_action: Some(format!(
+            "Fix the invalid configuration at {} and run `kclip sync setup`.",
+            config_path.display()
+        )),
+    };
+    write_sync_status(output, json, &report)
+}
+
+fn checklist(
+    output: &mut dyn Write,
+    success: bool,
+    label: &str,
+    value: &str,
+) -> Result<(), CliError> {
+    writeln!(
+        output,
+        "{} {label}: {value}",
+        if success { "✓" } else { "✗" }
+    )?;
+    Ok(())
+}
+
+fn show_replaced_pairing_notice(
+    output: &mut dyn Write,
+    previous: Option<&PairingCredential>,
+    current: &PairingCredential,
+) -> Result<(), CliError> {
+    if let Some(previous) = previous.filter(|value| value.pairing_id != current.pairing_id) {
+        writeln!(output)?;
+        writeln!(
+            output,
+            "Previous pairing ID: {}. Revoke that old device entry on the PyPasteServer host.",
+            previous.pairing_id
+        )?;
+    }
+    Ok(())
 }
 
 pub async fn send_request(
@@ -696,6 +1235,8 @@ fn next_request_id() -> u64 {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("command completed with an unhealthy result")]
+    Reported(u8),
     #[error("local daemon is unavailable")]
     DaemonUnavailable(io::ErrorKind),
     #[error("daemon returned an error: {0}")]
@@ -721,6 +1262,7 @@ pub enum CliError {
 impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
+            Self::Reported(code) => *code,
             Self::DaemonUnavailable(_) => 3,
             Self::Remote(error) => error.code.exit_code(),
             Self::Config(_) => 2,
@@ -741,5 +1283,430 @@ impl CliError {
             }
             _ => 1,
         }
+    }
+
+    pub fn already_reported(&self) -> bool {
+        matches!(self, Self::Reported(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+    use tokio::sync::Mutex;
+
+    static ENVIRONMENT: Mutex<()> = Mutex::const_new(());
+
+    struct MockSecrets {
+        values: VecDeque<String>,
+    }
+
+    struct MockRuntime {
+        restart: RestartOutcome,
+        statuses: VecDeque<Option<DaemonStatus>>,
+        delays: usize,
+    }
+
+    impl SecretInput for MockSecrets {
+        fn is_interactive(&self) -> bool {
+            true
+        }
+
+        fn read_hidden(&mut self, _prompt: &str) -> io::Result<String> {
+            self.values
+                .pop_front()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+        }
+    }
+
+    impl SetupRuntime for MockRuntime {
+        fn restart_daemon(&mut self) -> Result<RestartOutcome, CliError> {
+            Ok(self.restart)
+        }
+
+        fn daemon_status<'a>(
+            &'a mut self,
+            _socket: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = Option<DaemonStatus>> + 'a>> {
+            let status = self.statuses.pop_front().flatten();
+            Box::pin(async move { status })
+        }
+
+        fn delay<'a>(
+            &'a mut self,
+            _duration: std::time::Duration,
+        ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+            self.delays += 1;
+            Box::pin(async {})
+        }
+
+        fn verification_attempts(&self) -> usize {
+            self.statuses.len().max(1)
+        }
+    }
+
+    fn daemon_status(category: Option<&str>) -> DaemonStatus {
+        DaemonStatus {
+            daemon_available: true,
+            daemon_version: "test".into(),
+            schema_version: 1,
+            device_id: "device".into(),
+            synchronization_enabled: true,
+            synchronization_configured: true,
+            synchronization_state: "disconnected".into(),
+            authenticated: false,
+            credential_error: false,
+            pending_outbox_count: 0,
+            oldest_pending_age_millis: None,
+            last_successful_connection: None,
+            last_acknowledgement: None,
+            processed_server_cursor: 0,
+            last_sync_error_category: category.map(str::to_owned),
+            quarantined_event_count: 0,
+            plasma_enabled: false,
+        }
+    }
+
+    fn credential(id: &str, byte: u8) -> PairingCredential {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        PairingCredential {
+            version: 1,
+            pairing_id: id.into(),
+            pairing_secret: URL_SAFE_NO_PAD.encode([byte; 32]),
+        }
+    }
+
+    #[test]
+    fn guided_commit_writes_all_prerequisites_before_enabling_sync() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config/kclip/config.toml");
+        let key_path = temp.path().join("data/kclip/sync.key");
+        let pairing_path = temp.path().join("config/kclip/pairing.json");
+        let pairing = credential("eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5", 7);
+        let prepared = prepare_sync_setup(
+            &config_path,
+            "wss://clipboard.example.test/sync/v1",
+            "alice",
+            "office-laptop",
+        )
+        .unwrap();
+
+        commit_setup_files(
+            &key_path,
+            Some(&[11_u8; 32]),
+            &pairing_path,
+            &pairing,
+            None,
+            prepared,
+        )
+        .unwrap();
+
+        assert_eq!(read_sync_key(&key_path).unwrap(), [11_u8; 32]);
+        assert_eq!(
+            read_pairing(&pairing_path).unwrap().pairing_id,
+            pairing.pairing_id
+        );
+        let config = Config::load(Some(&config_path)).unwrap();
+        assert!(config.sync.enabled);
+        assert_eq!(config.sync.account_name.as_deref(), Some("alice"));
+        assert_eq!(
+            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&pairing_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn failed_config_commit_rolls_back_new_secrets_and_previous_pairing() {
+        let temp = TempDir::new().unwrap();
+        let blocked_parent = temp.path().join("blocked");
+        let config_path = blocked_parent.join("config.toml");
+        let key_path = temp.path().join("secrets/sync.key");
+        let pairing_path = temp.path().join("secrets/pairing.json");
+        let old = credential("eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5", 1);
+        let new = credential("8d5f7f7c-cbc5-4e05-ab9f-ecf002cbd42c", 2);
+        write_pairing(&pairing_path, &old).unwrap();
+        let prepared = prepare_sync_setup(
+            &config_path,
+            "wss://clipboard.example.test/sync/v1",
+            "alice",
+            "office-laptop",
+        )
+        .unwrap();
+        fs::write(&blocked_parent, b"not a directory").unwrap();
+
+        assert!(
+            commit_setup_files(
+                &key_path,
+                Some(&[9_u8; 32]),
+                &pairing_path,
+                &new,
+                Some(&old),
+                prepared,
+            )
+            .is_err()
+        );
+        assert!(!key_path.exists());
+        assert_eq!(
+            read_pairing(&pairing_path).unwrap().pairing_id,
+            old.pairing_id
+        );
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn obsolete_auth_key_and_migration_commands_are_absent() {
+        for command in ["auth", "key", "migrate-legacy"] {
+            assert!(Cli::try_parse_from(["kclip", command]).is_err());
+        }
+        assert!(Cli::try_parse_from(["kclip", "sync", "setup"]).is_ok());
+        assert!(Cli::try_parse_from(["kclip", "sync", "status"]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn declining_recovery_confirmation_changes_no_files() {
+        let _environment = ENVIRONMENT.lock().await;
+        let temp = TempDir::new().unwrap();
+        let config_home = temp.path().join("config-home");
+        let data_home = temp.path().join("data-home");
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+        let old_data = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+        let cli = Cli {
+            socket: Some(temp.path().join("unused.sock")),
+            json: false,
+            command: Command::Sync {
+                command: SyncCommand::Setup,
+            },
+        };
+        let fixture = include_str!("../../../fixtures/kclip-setup-v1.txt")
+            .trim()
+            .to_owned();
+        let mut secrets = MockSecrets {
+            values: VecDeque::from([fixture.clone()]),
+        };
+        let mut input = Cursor::new(b"1\nn\n".to_vec());
+        let mut output = Vec::new();
+        let error = execute_with_secret_input(&cli, &mut input, &mut output, &mut secrets)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CliError::Usage(_)));
+        assert!(!config_home.exists());
+        assert!(!data_home.exists());
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(!rendered.contains(&fixture));
+        assert!(!rendered.contains("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"));
+
+        unsafe {
+            match old_config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match old_data {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn additional_device_setup_uses_hidden_mnemonic_and_live_ready_status() {
+        let _environment = ENVIRONMENT.lock().await;
+        let temp = TempDir::new().unwrap();
+        let config_home = temp.path().join("config-home");
+        let data_home = temp.path().join("data-home");
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+        let old_data = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::set_var("XDG_DATA_HOME", &data_home);
+        }
+        let config_path = config_home.join("kclip/config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, "[slots.private]\nsync = false\n").unwrap();
+        let cli = Cli {
+            socket: Some(temp.path().join("mock.sock")),
+            json: false,
+            command: Command::Sync {
+                command: SyncCommand::Setup,
+            },
+        };
+        let fixture = include_str!("../../../fixtures/kclip-setup-v1.txt")
+            .trim()
+            .to_owned();
+        let mnemonic = mnemonic_for_key(&[5_u8; 32]).unwrap();
+        let mut secrets = MockSecrets {
+            values: VecDeque::from([fixture.clone(), mnemonic.clone()]),
+        };
+        let mut ready = daemon_status(None);
+        ready.synchronization_state = "connected".into();
+        ready.authenticated = true;
+        let mut runtime = MockRuntime {
+            restart: RestartOutcome::Restarted,
+            statuses: VecDeque::from([Some(ready)]),
+            delays: 0,
+        };
+        let mut input = Cursor::new(b"2\n".to_vec());
+        let mut output = Vec::new();
+        execute_with_runtime(&cli, &mut input, &mut output, &mut secrets, &mut runtime)
+            .await
+            .unwrap();
+
+        let config = Config::load(Some(&config_path)).unwrap();
+        assert!(config.sync.enabled);
+        assert_eq!(config.sync.account_name.as_deref(), Some("alice"));
+        assert_eq!(config.slots["private"].sync, Some(false));
+        assert_eq!(
+            read_sync_key(&data_home.join("kclip/sync.key")).unwrap(),
+            [5_u8; 32]
+        );
+        assert_eq!(
+            read_pairing(&config_home.join("kclip/pairing.json"))
+                .unwrap()
+                .pairing_id,
+            "eb6b89c3-6a6f-45fa-8da7-b74ea00bbfd5"
+        );
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Synchronization is ready."));
+        assert!(!rendered.contains(&fixture));
+        assert!(!rendered.contains(&mnemonic));
+        assert_eq!(runtime.delays, 0);
+
+        let mut retry_secrets = MockSecrets {
+            values: VecDeque::from([fixture]),
+        };
+        let mut retry_runtime = MockRuntime {
+            restart: RestartOutcome::Restarted,
+            statuses: VecDeque::from([Some(daemon_status(Some("connectivity")))]),
+            delays: 0,
+        };
+        let mut retry_input = Cursor::new(Vec::new());
+        let mut retry_output = Vec::new();
+        let retry = execute_with_runtime(
+            &cli,
+            &mut retry_input,
+            &mut retry_output,
+            &mut retry_secrets,
+            &mut retry_runtime,
+        )
+        .await;
+        assert!(matches!(retry, Err(CliError::Reported(8))));
+        assert!(Config::load(Some(&config_path)).unwrap().sync.enabled);
+        assert_eq!(
+            read_sync_key(&data_home.join("kclip/sync.key")).unwrap(),
+            [5_u8; 32]
+        );
+        assert!(
+            String::from_utf8(retry_output)
+                .unwrap()
+                .contains("configured but not connected")
+        );
+
+        unsafe {
+            match old_config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match old_data {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_status_reports_invalid_enabled_configuration_with_an_action() {
+        let _environment = ENVIRONMENT.lock().await;
+        let temp = TempDir::new().unwrap();
+        let config_home = temp.path().join("config-home");
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+        fs::create_dir_all(config_home.join("kclip")).unwrap();
+        fs::write(
+            config_home.join("kclip/config.toml"),
+            "[sync]\nenabled = true\nrelay_url = \"wss://example.test/sync/v1\"\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+        let cli = Cli {
+            socket: Some(temp.path().join("unused.sock")),
+            json: true,
+            command: Command::Sync {
+                command: SyncCommand::Status,
+            },
+        };
+        let mut secrets = MockSecrets {
+            values: VecDeque::new(),
+        };
+        let mut runtime = MockRuntime {
+            restart: RestartOutcome::Restarted,
+            statuses: VecDeque::new(),
+            delays: 0,
+        };
+        let mut input = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+        let result =
+            execute_with_runtime(&cli, &mut input, &mut output, &mut secrets, &mut runtime).await;
+        assert!(matches!(result, Err(CliError::Reported(2))));
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(report["last_error_category"], "invalid_configuration");
+        assert!(
+            report["configuration"]
+                .as_str()
+                .unwrap()
+                .contains("sync.account_name is required")
+        );
+        assert!(report["next_action"].as_str().unwrap().contains("Fix"));
+
+        unsafe {
+            match old_config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn unhealthy_runtime_categories_always_produce_specific_actions() {
+        let mut config = Config::default();
+        config.sync.enabled = true;
+        let mut status = daemon_status(Some("connectivity"));
+        assert!(
+            sync_next_action(&config, "present", "present", Some(&status))
+                .unwrap()
+                .contains("reachability")
+        );
+        status.credential_error = true;
+        status.last_sync_error_category = Some("authentication".into());
+        assert!(
+            sync_next_action(&config, "present", "present", Some(&status))
+                .unwrap()
+                .contains("server operator")
+        );
+        status.credential_error = false;
+        status.quarantined_event_count = 1;
+        status.last_sync_error_category = Some("cryptography".into());
+        assert!(
+            sync_next_action(&config, "present", "present", Some(&status))
+                .unwrap()
+                .contains("correct account recovery words")
+        );
+        assert!(
+            sync_next_action(&config, "present", "present", None)
+                .unwrap()
+                .contains("kclipd.service")
+        );
     }
 }
