@@ -7,7 +7,8 @@ use kclip_crypto::{
 };
 use kclip_protocol::{PROTOCOL_VERSION, RevisionMetadata};
 use kclip_storage::{
-    InboxEvent, OutboxItem, RemoteApplyOutcome, Storage, StorageError, unix_millis,
+    InboxEvent, OutboxItem, RemoteApplyOutcome, RetentionFloorOutcome, Storage, StorageError,
+    unix_millis,
 };
 use serde::{Deserialize, Serialize};
 use snow::{Builder, params::NoiseParams};
@@ -62,6 +63,14 @@ pub enum ServerMessage {
     Ready {
         protocol_version: u16,
         connection_id: String,
+        latest_sequence: u64,
+        earliest_sequence: u64,
+        replay_from: u64,
+        history_truncated: bool,
+    },
+    HistoryTruncated {
+        protocol_version: u16,
+        earliest_sequence: u64,
         latest_sequence: u64,
         replay_from: u64,
     },
@@ -186,6 +195,8 @@ pub struct RuntimeStatus {
     pub credential_error: bool,
     pub last_successful_connection: Option<i64>,
     pub last_error_category: Option<String>,
+    pub history_truncated: bool,
+    pub startup_import_ready: bool,
 }
 
 #[derive(Clone)]
@@ -193,6 +204,7 @@ pub struct WorkerControl {
     status: Arc<RwLock<RuntimeStatus>>,
     wake: Arc<Notify>,
     stop: watch::Sender<bool>,
+    startup_import_ready: watch::Receiver<bool>,
 }
 
 impl WorkerControl {
@@ -206,6 +218,10 @@ impl WorkerControl {
 
     pub fn shutdown(&self) {
         let _ = self.stop.send(true);
+    }
+
+    pub fn startup_import_ready(&self) -> watch::Receiver<bool> {
+        self.startup_import_ready.clone()
     }
 
     pub async fn wait_stopped(&self, timeout: Duration) -> bool {
@@ -233,10 +249,12 @@ pub fn start_worker(
     }));
     let wake = Arc::new(Notify::new());
     let (stop, stop_receiver) = watch::channel(false);
+    let (startup_import_ready, startup_import_receiver) = watch::channel(false);
     let control = WorkerControl {
         status: status.clone(),
         wake: wake.clone(),
         stop,
+        startup_import_ready: startup_import_receiver,
     };
     tokio::spawn(async move {
         worker_loop(
@@ -246,6 +264,7 @@ pub fn start_worker(
             status,
             wake,
             stop_receiver,
+            startup_import_ready,
         )
         .await;
     });
@@ -259,6 +278,7 @@ async fn worker_loop(
     status: Arc<RwLock<RuntimeStatus>>,
     wake: Arc<Notify>,
     mut stop: watch::Receiver<bool>,
+    startup_import_ready: watch::Sender<bool>,
 ) {
     let mut delay = configuration.reconnect_min_delay;
     loop {
@@ -275,6 +295,7 @@ async fn worker_loop(
                 &status,
                 &wake,
                 &mut connection_stop,
+                &startup_import_ready,
             ) => result,
             _ = stop.changed() => break,
         };
@@ -286,6 +307,8 @@ async fn worker_loop(
                 delay = configuration.reconnect_min_delay;
             }
             Err(error) => {
+                let _ = startup_import_ready.send(true);
+                status.write().await.startup_import_ready = true;
                 let category = error.category().to_owned();
                 let credential =
                     matches!(error, SyncError::Credentials(_) | SyncError::Authentication);
@@ -314,6 +337,7 @@ async fn connect_once(
     status: &Arc<RwLock<RuntimeStatus>>,
     wake: &Arc<Notify>,
     stop: &mut watch::Receiver<bool>,
+    startup_import_ready: &watch::Sender<bool>,
 ) -> Result<(), SyncError> {
     validate_relay_url(&configuration.relay_url)?;
     let credential = read_pairing(&configuration.pairing_path)?;
@@ -366,24 +390,50 @@ async fn connect_once(
     )
     .await?;
     let ready = receive_json(&mut websocket, &mut wire_security, max_content_size).await?;
-    match ready {
+    let (latest_sequence, history_truncated) = match ready {
         ServerMessage::Ready {
             protocol_version,
             latest_sequence,
+            earliest_sequence,
             replay_from,
+            history_truncated,
             ..
-        } if protocol_version == PROTOCOL_VERSION
-            && replay_from == resume_after.saturating_add(1)
-            && latest_sequence >= resume_after => {}
+        } => {
+            validate_ready(
+                protocol_version,
+                resume_after,
+                latest_sequence,
+                earliest_sequence,
+                replay_from,
+                history_truncated,
+            )?;
+            if history_truncated {
+                recover_inbox(storage, &key, max_content_size, status).await?;
+                let cursor = accept_retention_floor(storage, earliest_sequence, latest_sequence)?;
+                send_json(
+                    &mut websocket,
+                    &mut wire_security,
+                    &ClientMessage::Checkpoint {
+                        server_sequence: cursor,
+                    },
+                )
+                .await?;
+            }
+            (latest_sequence, history_truncated)
+        }
         ServerMessage::Error { code, .. } if code == "authentication_failed" => {
             return Err(SyncError::Authentication);
+        }
+        ServerMessage::Error { code, .. } if code == "replay_unavailable" => {
+            return Err(SyncError::ReplayUnavailable);
         }
         _ => {
             return Err(SyncError::Protocol(
                 "server did not send a valid ready message",
             ));
         }
-    }
+    };
+    let replay_complete = storage.sync_status()?.server_cursor >= latest_sequence;
     {
         let mut current = status.write().await;
         current.state = "connected".into();
@@ -391,6 +441,11 @@ async fn connect_once(
         current.credential_error = false;
         current.last_successful_connection = Some(unix_millis()?);
         current.last_error_category = None;
+        current.history_truncated = history_truncated;
+        current.startup_import_ready |= replay_complete;
+        if replay_complete {
+            let _ = startup_import_ready.send(true);
+        }
     }
     info!("synchronization connection established");
     let mut last_ping = tokio::time::Instant::now();
@@ -419,7 +474,7 @@ async fn connect_once(
                         break;
                     }
                     MessageOutcome::PermanentOutboxError(failed) if failed == message_id => break,
-                    MessageOutcome::Event(cursor) => {
+                    MessageOutcome::Checkpoint(cursor) => {
                         send_json(
                             &mut websocket,
                             &mut wire_security,
@@ -428,6 +483,13 @@ async fn connect_once(
                             },
                         )
                         .await?;
+                        mark_initial_replay_complete(
+                            status,
+                            startup_import_ready,
+                            cursor,
+                            latest_sequence,
+                        )
+                        .await;
                     }
                     _ => {}
                 }
@@ -437,10 +499,11 @@ async fn connect_once(
 
         tokio::select! {
             message = receive_json(&mut websocket, &mut wire_security, max_content_size) => {
-                if let MessageOutcome::Event(cursor) =
+                if let MessageOutcome::Checkpoint(cursor) =
                     handle_server_message(storage, &key, max_content_size, status, message?).await?
                 {
                     send_json(&mut websocket, &mut wire_security, &ClientMessage::Checkpoint { server_sequence: cursor }).await?;
+                    mark_initial_replay_complete(status, startup_import_ready, cursor, latest_sequence).await;
                 }
             }
             _ = wake.notified() => {}
@@ -458,8 +521,10 @@ async fn connect_once(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum MessageOutcome {
-    Event(u64),
+    Checkpoint(u64),
+    Noop,
     Acknowledged(String),
     PermanentOutboxError(String),
 }
@@ -507,7 +572,32 @@ async fn handle_server_message(
             };
             let cursor = process_event(storage, key, max_content_size, &event, status).await?;
             debug!(cursor, "synchronization event durably processed");
-            Ok(MessageOutcome::Event(cursor))
+            Ok(MessageOutcome::Checkpoint(cursor))
+        }
+        ServerMessage::HistoryTruncated {
+            protocol_version,
+            earliest_sequence,
+            latest_sequence,
+            replay_from,
+        } => {
+            validate_active_retention(
+                protocol_version,
+                earliest_sequence,
+                latest_sequence,
+                replay_from,
+            )?;
+            recover_inbox(storage, key, max_content_size, status).await?;
+            status.write().await.history_truncated = true;
+            match storage.accept_retention_floor(earliest_sequence, latest_sequence)? {
+                RetentionFloorOutcome::Advanced(cursor) => {
+                    info!(
+                        earliest_sequence,
+                        latest_sequence, "accepted server retention floor"
+                    );
+                    Ok(MessageOutcome::Checkpoint(cursor))
+                }
+                RetentionFloorOutcome::Unchanged(_) => Ok(MessageOutcome::Noop),
+            }
         }
         ServerMessage::Error {
             code,
@@ -550,7 +640,33 @@ async fn process_event(
     status: &Arc<RwLock<RuntimeStatus>>,
 ) -> Result<u64, SyncError> {
     validate_outer_event(event, max_content_size)?;
+    let cursor = storage.sync_status()?.server_cursor;
+    let expected = cursor
+        .checked_add(1)
+        .ok_or(SyncError::Protocol("server cursor overflow"))?;
+    if event.server_sequence < expected {
+        return if storage.inbox_contains(event)? {
+            Ok(cursor)
+        } else {
+            Err(SyncError::Protocol(
+                "event sequence is behind the durable cursor",
+            ))
+        };
+    }
+    if event.server_sequence > expected {
+        return Err(SyncError::Protocol("event sequence is not contiguous"));
+    }
     storage.record_inbox(event)?;
+    apply_recorded_event(storage, key, max_content_size, event, status).await
+}
+
+async fn apply_recorded_event(
+    storage: &Storage,
+    key: &[u8; 32],
+    max_content_size: u64,
+    event: &InboxEvent,
+    status: &Arc<RwLock<RuntimeStatus>>,
+) -> Result<u64, SyncError> {
     match decrypt_and_apply(storage, key, max_content_size, event) {
         Ok((outcome, cursor)) => {
             debug!(?outcome, cursor, "applied synchronization event");
@@ -563,6 +679,79 @@ async fn process_event(
             Ok(cursor)
         }
         Err(error) => Err(error),
+    }
+}
+
+fn validate_ready(
+    protocol_version: u16,
+    resume_after: u64,
+    latest_sequence: u64,
+    earliest_sequence: u64,
+    replay_from: u64,
+    history_truncated: bool,
+) -> Result<(), SyncError> {
+    if protocol_version != PROTOCOL_VERSION {
+        return Err(SyncError::Protocol("unsupported ready protocol version"));
+    }
+    if resume_after > latest_sequence {
+        return Err(SyncError::ReplayUnavailable);
+    }
+    let next = resume_after
+        .checked_add(1)
+        .ok_or(SyncError::Protocol("resume cursor overflow"))?;
+    let upper = latest_sequence
+        .checked_add(1)
+        .ok_or(SyncError::Protocol("latest server sequence overflow"))?;
+    if earliest_sequence == 0 || earliest_sequence > upper {
+        return Err(SyncError::Protocol("invalid ready retention range"));
+    }
+    if replay_from != next.max(earliest_sequence) || history_truncated != (next < earliest_sequence)
+    {
+        return Err(SyncError::Protocol("inconsistent ready replay metadata"));
+    }
+    Ok(())
+}
+
+fn validate_active_retention(
+    protocol_version: u16,
+    earliest_sequence: u64,
+    latest_sequence: u64,
+    replay_from: u64,
+) -> Result<(), SyncError> {
+    let upper = latest_sequence
+        .checked_add(1)
+        .ok_or(SyncError::Protocol("latest server sequence overflow"))?;
+    if protocol_version != PROTOCOL_VERSION
+        || earliest_sequence == 0
+        || earliest_sequence > upper
+        || replay_from != earliest_sequence
+    {
+        return Err(SyncError::Protocol("invalid active retention metadata"));
+    }
+    Ok(())
+}
+
+fn accept_retention_floor(
+    storage: &Storage,
+    earliest_sequence: u64,
+    latest_sequence: u64,
+) -> Result<u64, SyncError> {
+    match storage.accept_retention_floor(earliest_sequence, latest_sequence)? {
+        RetentionFloorOutcome::Advanced(cursor) | RetentionFloorOutcome::Unchanged(cursor) => {
+            Ok(cursor)
+        }
+    }
+}
+
+async fn mark_initial_replay_complete(
+    status: &RwLock<RuntimeStatus>,
+    startup_import_ready: &watch::Sender<bool>,
+    cursor: u64,
+    latest_sequence: u64,
+) {
+    if cursor >= latest_sequence {
+        status.write().await.startup_import_ready = true;
+        let _ = startup_import_ready.send(true);
     }
 }
 
@@ -643,7 +832,13 @@ async fn recover_inbox(
     status: &Arc<RwLock<RuntimeStatus>>,
 ) -> Result<(), SyncError> {
     for event in storage.pending_inbox()? {
-        process_event(storage, key, maximum, &event, status).await?;
+        validate_outer_event(&event, maximum)?;
+        if !storage.inbox_contains(&event)? {
+            return Err(SyncError::Protocol(
+                "pending inbox event disappeared during recovery",
+            ));
+        }
+        apply_recorded_event(storage, key, maximum, &event, status).await?;
     }
     Ok(())
 }
@@ -946,6 +1141,8 @@ pub enum SyncError {
     Credentials(String),
     #[error("server authentication failed")]
     Authentication,
+    #[error("server cannot replay from the durable local cursor")]
+    ReplayUnavailable,
     #[error("server protocol error: {0}")]
     Protocol(&'static str),
     #[error("server rejected request: {0}")]
@@ -976,6 +1173,7 @@ impl SyncError {
             Self::SetupCode(_) => "setup_code",
             Self::Credentials(_) => "credentials",
             Self::Authentication => "authentication",
+            Self::ReplayUnavailable => "replay_unavailable",
             Self::Protocol(_) | Self::Json(_) | Self::Header(_) | Self::Noise(_) => "protocol",
             Self::Server(_) => "server",
             Self::Transport(_) | Self::Disconnected | Self::WebSocket(_) => "connectivity",
@@ -1369,10 +1567,213 @@ mod tests {
             let message: ClientMessage = serde_json::from_value(fixture[name].clone()).unwrap();
             assert_eq!(serde_json::to_value(message).unwrap(), fixture[name]);
         }
-        for name in ["ready", "push_ack", "event"] {
+        for name in ["ready", "history_truncated", "push_ack", "event"] {
             let message: ServerMessage = serde_json::from_value(fixture[name].clone()).unwrap();
             assert_eq!(serde_json::to_value(message).unwrap(), fixture[name]);
         }
+    }
+
+    #[test]
+    fn ready_contract_validates_retention_invariants_and_rejects_old_shape() {
+        assert!(validate_ready(PROTOCOL_VERSION, 42, 57, 50, 50, true).is_ok());
+        assert!(validate_ready(PROTOCOL_VERSION, 42, 57, 1, 43, false).is_ok());
+        assert!(validate_ready(PROTOCOL_VERSION, 57, 57, 58, 58, false).is_ok());
+        assert!(validate_ready(PROTOCOL_VERSION, 42, 57, 50, 43, true).is_err());
+        assert!(validate_ready(PROTOCOL_VERSION, 42, 57, 50, 50, false).is_err());
+        assert!(validate_ready(PROTOCOL_VERSION, 58, 57, 50, 59, false).is_err());
+        assert!(validate_ready(PROTOCOL_VERSION, 42, 57, 59, 59, true).is_err());
+
+        let old_ready = serde_json::json!({
+            "type": "ready",
+            "protocol_version": 1,
+            "connection_id": "old-contract",
+            "latest_sequence": 57,
+            "replay_from": 43
+        });
+        assert!(serde_json::from_value::<ServerMessage>(old_ready).is_err());
+    }
+
+    #[test]
+    fn active_retention_contract_validates_required_range() {
+        assert!(validate_active_retention(PROTOCOL_VERSION, 50, 57, 50).is_ok());
+        assert!(validate_active_retention(PROTOCOL_VERSION, 58, 57, 58).is_ok());
+        assert!(validate_active_retention(PROTOCOL_VERSION, 50, 57, 51).is_err());
+        assert!(validate_active_retention(PROTOCOL_VERSION, 0, 57, 0).is_err());
+        assert!(validate_active_retention(PROTOCOL_VERSION, 59, 57, 59).is_err());
+    }
+
+    #[tokio::test]
+    async fn event_gap_is_rejected_before_any_inbox_or_revision_side_effect() {
+        let source_temp = TempDir::new().unwrap();
+        let source = storage(&source_temp);
+        source
+            .copy_with_options(
+                "default",
+                b"future",
+                None,
+                MutationOptions {
+                    source_adapter: "cli".into(),
+                    local_only: false,
+                    enqueue_sync: true,
+                },
+            )
+            .unwrap();
+        let key = [31_u8; 32];
+        let event = event_from_push(
+            outbox_push(&source, &source.pending_outbox(1).unwrap()[0], &key).unwrap(),
+            2,
+            source.device_id().unwrap(),
+        );
+        let destination_temp = TempDir::new().unwrap();
+        let destination = storage(&destination_temp);
+        let status = Arc::new(RwLock::new(RuntimeStatus::default()));
+        assert!(matches!(
+            process_event(&destination, &key, 1024, &event, &status).await,
+            Err(SyncError::Protocol("event sequence is not contiguous"))
+        ));
+        assert!(destination.pending_inbox().unwrap().is_empty());
+        assert!(destination.list().unwrap().is_empty());
+        assert!(destination.pending_outbox(1).unwrap().is_empty());
+        assert_eq!(destination.sync_status().unwrap().server_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn active_retention_advances_and_then_accepts_the_retained_suffix() {
+        let source_temp = TempDir::new().unwrap();
+        let source = storage(&source_temp);
+        source
+            .copy_with_options(
+                "default",
+                b"retained",
+                None,
+                MutationOptions {
+                    source_adapter: "cli".into(),
+                    local_only: false,
+                    enqueue_sync: true,
+                },
+            )
+            .unwrap();
+        let key = [32_u8; 32];
+        let event = event_from_push(
+            outbox_push(&source, &source.pending_outbox(1).unwrap()[0], &key).unwrap(),
+            5,
+            source.device_id().unwrap(),
+        );
+        let destination_temp = TempDir::new().unwrap();
+        let destination = storage(&destination_temp);
+        let mut revisions = destination.subscribe_revisions();
+        let status = Arc::new(RwLock::new(RuntimeStatus::default()));
+        assert_eq!(
+            handle_server_message(
+                &destination,
+                &key,
+                1024,
+                &status,
+                ServerMessage::HistoryTruncated {
+                    protocol_version: PROTOCOL_VERSION,
+                    earliest_sequence: 5,
+                    latest_sequence: 5,
+                    replay_from: 5,
+                },
+            )
+            .await
+            .unwrap(),
+            MessageOutcome::Checkpoint(4)
+        );
+        assert!(matches!(
+            revisions.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            handle_server_message(
+                &destination,
+                &key,
+                1024,
+                &status,
+                ServerMessage::HistoryTruncated {
+                    protocol_version: PROTOCOL_VERSION,
+                    earliest_sequence: 5,
+                    latest_sequence: 5,
+                    replay_from: 5,
+                },
+            )
+            .await
+            .unwrap(),
+            MessageOutcome::Noop
+        );
+        let message = ServerMessage::Event {
+            server_sequence: event.server_sequence,
+            message_id: event.message_id,
+            sender_device_id: event.source_device_id,
+            algorithm: event.algorithm,
+            nonce: event.nonce,
+            ciphertext: event.ciphertext,
+            tag: event.tag,
+            accepted_at: event.accepted_at,
+        };
+        assert_eq!(
+            handle_server_message(&destination, &key, 1024, &status, message)
+                .await
+                .unwrap(),
+            MessageOutcome::Checkpoint(5)
+        );
+        assert_eq!(destination.paste("default").unwrap().1, b"retained");
+        assert_eq!(
+            destination
+                .sync_status()
+                .unwrap()
+                .retention_truncation_count,
+            1
+        );
+        assert!(status.read().await.history_truncated);
+    }
+
+    #[tokio::test]
+    async fn retention_floor_finishes_a_persisted_inbox_gap_before_skipping_it() {
+        let source_temp = TempDir::new().unwrap();
+        let source = storage(&source_temp);
+        source
+            .copy_with_options(
+                "default",
+                b"already durable",
+                None,
+                MutationOptions {
+                    source_adapter: "cli".into(),
+                    local_only: false,
+                    enqueue_sync: true,
+                },
+            )
+            .unwrap();
+        let key = [33_u8; 32];
+        let event = event_from_push(
+            outbox_push(&source, &source.pending_outbox(1).unwrap()[0], &key).unwrap(),
+            2,
+            source.device_id().unwrap(),
+        );
+        let destination_temp = TempDir::new().unwrap();
+        let destination = storage(&destination_temp);
+        destination.record_inbox(&event).unwrap();
+        let status = Arc::new(RwLock::new(RuntimeStatus::default()));
+        assert_eq!(
+            handle_server_message(
+                &destination,
+                &key,
+                1024,
+                &status,
+                ServerMessage::HistoryTruncated {
+                    protocol_version: PROTOCOL_VERSION,
+                    earliest_sequence: 5,
+                    latest_sequence: 5,
+                    replay_from: 5,
+                },
+            )
+            .await
+            .unwrap(),
+            MessageOutcome::Checkpoint(4)
+        );
+        assert!(destination.pending_inbox().unwrap().is_empty());
+        assert_eq!(destination.sync_status().unwrap().server_cursor, 4);
+        assert_eq!(destination.paste("default").unwrap().1, b"already durable");
     }
 
     #[test]
@@ -1525,7 +1926,9 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     connection_id: "connection-1".into(),
                     latest_sequence: 0,
+                    earliest_sequence: 1,
                     replay_from: 1,
+                    history_truncated: false,
                 },
             )
             .await;
@@ -1598,6 +2001,114 @@ mod tests {
         let sync = storage.sync_status().unwrap();
         assert_eq!(sync.pending_outbox_count, 0);
         assert_eq!(sync.server_cursor, 1);
+        control.shutdown();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn noise_worker_checkpoints_empty_initial_and_active_retention_gaps() {
+        let temp = TempDir::new().unwrap();
+        let storage = storage(&temp);
+        let mut revisions = storage.subscribe_revisions();
+        let pairing_path = temp.path().join("config/pairing.json");
+        let key_path = temp.path().join("data/sync.key");
+        let pairing_id = "c0a8bb68-0135-48bc-87d5-d76c98ee4b23";
+        let psk = [41_u8; 32];
+        write_pairing(
+            &pairing_path,
+            &PairingCredential {
+                version: 1,
+                pairing_id: pairing_id.into(),
+                pairing_secret: URL_SAFE_NO_PAD.encode(psk),
+            },
+        )
+        .unwrap();
+        kclip_crypto::write_sync_key(&key_path, &[42_u8; 32]).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_hdr_async(
+                stream,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                    assert_eq!(
+                        request.headers().get("x-kclip-pairing-id").unwrap(),
+                        pairing_id
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let mut noise = noise_server_handshake(&mut socket, &psk).await;
+            let ClientMessage::Hello { resume_after, .. } =
+                noise_server_receive(&mut socket, &mut noise).await
+            else {
+                panic!("expected hello")
+            };
+            assert_eq!(resume_after, 0);
+            noise_server_send(
+                &mut socket,
+                &mut noise,
+                &ServerMessage::Ready {
+                    protocol_version: PROTOCOL_VERSION,
+                    connection_id: "retention-connection".into(),
+                    latest_sequence: 4,
+                    earliest_sequence: 5,
+                    replay_from: 5,
+                    history_truncated: true,
+                },
+            )
+            .await;
+            assert_eq!(
+                noise_server_receive(&mut socket, &mut noise).await,
+                ClientMessage::Checkpoint { server_sequence: 4 }
+            );
+            noise_server_send(
+                &mut socket,
+                &mut noise,
+                &ServerMessage::HistoryTruncated {
+                    protocol_version: PROTOCOL_VERSION,
+                    earliest_sequence: 7,
+                    latest_sequence: 6,
+                    replay_from: 7,
+                },
+            )
+            .await;
+            assert_eq!(
+                noise_server_receive(&mut socket, &mut noise).await,
+                ClientMessage::Checkpoint { server_sequence: 6 }
+            );
+        });
+
+        let control = start_worker(
+            Arc::clone(&storage),
+            ResolvedSyncConfig {
+                relay_url: format!("ws://{address}/sync/v1"),
+                reconnect_min_delay: Duration::from_millis(10),
+                reconnect_max_delay: Duration::from_millis(50),
+                account_name: "alice".into(),
+                device_name: "retention-test".into(),
+                pairing_path,
+                sync_key_path: key_path,
+            },
+            1024,
+        );
+        let startup_ready = control.startup_import_ready();
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        let sync = storage.sync_status().unwrap();
+        assert_eq!(sync.server_cursor, 6);
+        assert_eq!(sync.last_retention_floor, Some(7));
+        assert_eq!(sync.retention_truncation_count, 2);
+        assert!(*startup_ready.borrow());
+        assert!(matches!(
+            revisions.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         control.shutdown();
     }
 }

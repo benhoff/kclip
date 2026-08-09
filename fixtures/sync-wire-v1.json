@@ -10,7 +10,16 @@
     "protocol_version": 1,
     "connection_id": "connection-contract",
     "latest_sequence": 57,
-    "replay_from": 43
+    "earliest_sequence": 1,
+    "replay_from": 43,
+    "history_truncated": false
+  },
+  "history_truncated": {
+    "type": "history_truncated",
+    "protocol_version": 1,
+    "earliest_sequence": 50,
+    "latest_sequence": 57,
+    "replay_from": 50
   },
   "push": {
     "type": "push",

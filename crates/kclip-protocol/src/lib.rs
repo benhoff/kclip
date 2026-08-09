@@ -152,6 +152,14 @@ pub struct DaemonStatus {
     #[serde(default)]
     pub processed_server_cursor: u64,
     #[serde(default)]
+    pub history_truncated: bool,
+    #[serde(default)]
+    pub last_retention_floor: Option<u64>,
+    #[serde(default)]
+    pub last_retention_at: Option<i64>,
+    #[serde(default)]
+    pub retention_truncation_count: u64,
+    #[serde(default)]
     pub last_sync_error_category: Option<String>,
     #[serde(default)]
     pub quarantined_event_count: u64,

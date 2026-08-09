@@ -1,6 +1,6 @@
 # PyPasteServer Sync Client Specification for kclipd
 
-- Status: Draft 0.1
+- Status: Draft 0.3
 - Audience: kclip and PyPasteServer maintainers
 - Companion specification: `PyPasteServer/docs/kclip-sync-server-spec.md`
 
@@ -9,11 +9,9 @@
 This document specifies how the Rust `kclipd` daemon synchronizes its local
 revision store through PyPasteServer. All supported end-user client behavior,
 including authentication, encryption, offline queues, synchronization, and
-desktop adapters, belongs in this repository. PyPasteServer remains a remote
-authenticated relay and opaque encrypted event store.
-
-The Python desktop daemon in PyPasteServer is a migration source, not part of
-the target architecture.
+desktop adapters, belongs in this repository. PyPasteServer remains a bounded,
+lossy, authenticated relay for opaque encrypted events. It is not a permanent
+clipboard history or a complete-state backup.
 
 The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
 
@@ -26,6 +24,10 @@ The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
 - Encrypt all clipboard semantics before they leave the device.
 - Deliver local revisions after process and network restarts.
 - Apply remote revisions idempotently and without feedback loops.
+- Recover automatically from a server-retained suffix after an older event
+  prefix expires.
+- Make relay-history loss visible to operators without requiring end users to
+  manage history or repair cursors.
 - Replace the PyPasteServer Python daemon and end-user CLI functionality.
 - Use a versioned client/server contract with cross-repository test fixtures.
 
@@ -37,6 +39,16 @@ The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
 - Synchronizing revisions marked local-only or slots configured not to sync.
 - Rotating the shared account encryption key in sync protocol version 1.
 - Supporting the experimental `/dev/kclip` kernel interface.
+- Reconstructing revisions, slot values, or tombstones that expired before the
+  client received them.
+- Server-side snapshots, per-slot compaction, or state transfer. Slot identity
+  is encrypted and unavailable to the relay.
+- Pruning the client's local revision database. Local retention is a separate
+  concern from relay retention.
+- Backward compatibility with the pre-retention sync-v1 wire contract. This
+  specification replaces that contract rather than negotiating with it.
+- Importing legacy bearer tokens, Python-client configuration, or the retired
+  server endpoints.
 
 ## 4. Target architecture
 
@@ -86,7 +98,6 @@ relay_url = "ws://192.168.1.50:8001/sync/v1"
 reconnect_min_delay = "1s"
 reconnect_max_delay = "5m"
 device_name = "workstation"
-token_path = "/home/example/.config/kclip/token.json"
 pairing_path = "/home/example/.config/kclip/pairing.json"
 
 [security]
@@ -100,11 +111,9 @@ sync = true
 Requirements:
 
 - `enabled` defaults to false.
-- A Noise-paired client MAY use a `ws://` relay on a trusted LAN. Legacy bearer
-  authentication MUST require `wss://` unless an explicit development-only
-  insecure override is set.
-- `pairing_path`, `token_path`, and `sync_key_path` MUST resolve through normal
-  XDG defaults when omitted.
+- A Noise-paired client MAY use a `ws://` relay on a trusted LAN.
+- `pairing_path` and `sync_key_path` MUST resolve through normal XDG defaults
+  when omitted.
 - Secret files MUST be owned by the user, MUST be regular non-symlink files,
   and MUST not be accessible by group or other users.
 - The 32-byte sync key MUST NOT be written to logs or status output.
@@ -118,8 +127,7 @@ security prerequisites are satisfied.
 
 ## 7. Authentication and credential ownership
 
-The Rust `kclip` CLI should provide the end-user account commands needed to
-replace the Python CLI:
+The Rust `kclip` CLI provides the supported device and key commands:
 
 ```text
 kclip auth pair
@@ -130,45 +138,31 @@ kclip key import
 kclip key export
 ```
 
-`kclip auth pair` MUST read the one-time code through hidden input, validate its
+`kclip auth pair` MUST read the setup code through hidden input, validate its
 version, canonical pairing ID, and 32-byte base64url secret, and atomically
-write it with mode `0600` inside a mode `0700` directory. It MUST remove a local
-bearer token after pairing so a handshake failure cannot trigger downgrade.
-Local logout removes the credential but does not revoke the server copy; the
-administrator MUST revoke that pairing ID separately.
-
-Legacy password login and registration may remain for migration, but they MUST
-require TLS. Passwords MUST never appear in command-line options or cross a
-plaintext HTTP connection.
+write it with mode `0600` inside a mode `0700` directory. Local logout removes
+the pairing credential but does not revoke the server copy; the administrator
+MUST revoke that pairing ID separately.
 
 Version 1 uses one 32-byte account synchronization key shared by the user's
-devices. For compatibility, migration MUST support the existing files:
-
-```text
-~/.config/clipboard_app/token.json
-~/.config/clipboard_app/key
-```
-
-The old key file contains the 32 bytes of entropy represented by the existing
-24-word BIP-39 mnemonic. Import MUST copy the value into the kclip-owned path
-using safe permissions; the daemon MUST NOT keep reading a mutable legacy file
-after successful migration.
-
-Generating an unrelated key during login would isolate that device from
-existing ciphertext. The CLI MUST clearly distinguish creating a new account
-key from importing the mnemonic for an existing account.
+devices. `kclip key import` imports the current account key through the supported
+key-transfer format and writes only the kclip-owned path with safe permissions.
+It MUST NOT discover or import Python-client files automatically. Generating an
+unrelated key would isolate that device from existing ciphertext, so the CLI
+MUST clearly distinguish generating a new account key from joining an existing
+account key.
 
 Recovery escrow and account-key rotation require a later specification.
 
-## 8. Server transport
+## 8. Server transport and rolling retention
 
 `kclipd` connects to the `/sync/v1` WebSocket protocol defined by the companion
 server specification.
 
 Client requirements:
 
-- Prefer the pairing file whenever it exists; an invalid pairing file is a hard
-  credential error and MUST NOT cause bearer fallback.
+- Require a valid pairing file. A missing or invalid pairing is a hard
+  credential error; no alternate sync authentication method exists.
 - Send `X-Kclip-Transport: noise-psk-v1` and the public pairing ID, then initiate
   `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` with the device PSK.
 - Encrypt every post-handshake application message as binary chunks matching
@@ -183,6 +177,95 @@ Client requirements:
 - Validate TLS certificates using the platform trust store whenever `wss` is
   configured.
 - Never fall back silently from `wss://` to plaintext WebSocket.
+
+### 8.1 Initial replay contract
+
+The client sends its durable local cursor as `resume_after` in `hello`. The
+server's `ready` response has this required shape:
+
+```json
+{
+  "type": "ready",
+  "protocol_version": 1,
+  "connection_id": "5c3f...",
+  "latest_sequence": 57,
+  "earliest_sequence": 50,
+  "replay_from": 50,
+  "history_truncated": true
+}
+```
+
+All fields shown above are required. The client MUST reject a `ready` that
+omits `earliest_sequence` or `history_truncated`; it MUST NOT infer the old,
+unbounded replay behavior.
+
+The fields obey these invariants:
+
+```text
+1 <= earliest_sequence <= latest_sequence + 1
+replay_from = max(resume_after + 1, earliest_sequence)
+history_truncated = (resume_after + 1 < earliest_sequence)
+```
+
+When no events are retained, `earliest_sequence` equals
+`latest_sequence + 1`. A `resume_after` greater than `latest_sequence` means
+the server sequence history was reset or replaced; the server returns the
+terminal `replay_unavailable` error and the client MUST NOT silently move its
+cursor backward.
+
+When `history_truncated` is false, normal contiguous replay begins at
+`resume_after + 1`. When it is true, the client MUST:
+
+1. Validate the complete `ready` message and its invariants.
+2. Durably advance its processed cursor through `earliest_sequence - 1`.
+3. Send a checkpoint for that cursor, including when the retained buffer is
+   empty.
+4. Process retained `event` messages beginning at `replay_from` through the
+   normal inbox path.
+
+Advancing across the expired prefix creates no inbox rows, revisions,
+tombstones, HLC updates, outbox entries, or adapter notifications. Existing
+local slot heads remain unchanged unless a retained event later replaces them.
+This intentionally permits stale slots and missed clears on a device that was
+offline beyond the rolling buffer.
+
+### 8.2 Truncation on an active connection
+
+If retention passes an already-connected client's next deliverable sequence,
+the server sends this message before sending more events:
+
+```json
+{
+  "type": "history_truncated",
+  "protocol_version": 1,
+  "earliest_sequence": 50,
+  "latest_sequence": 57,
+  "replay_from": 50
+}
+```
+
+All fields are required. The client MUST recognize this as a normal control
+message, validate `replay_from == earliest_sequence` and
+`1 <= earliest_sequence <= latest_sequence + 1`, durably advance through
+`earliest_sequence - 1`, checkpoint the new cursor, and continue consuming the
+same connection. It MUST NOT deserialize the message as an error, disconnect
+solely because history expired, or require user intervention.
+
+Receiving the same or an older retention floor is an idempotent no-op. A floor
+beyond the current cursor MUST be committed before any event at or after that
+floor is applied. Locally persisted inbox entries below the floor remain real
+data: the daemon MUST finish or quarantine them before advancing the cursor
+past them.
+
+### 8.3 Compatibility policy
+
+The rolling-retention messages above are the only supported sync-v1 contract.
+The client and server will be deployed as a matched pair. There is no feature
+bit, optional-field interpretation, old-`ready` fallback, dual decoder, or
+migration window for clients implementing the earlier unbounded contract.
+Shared wire fixtures MUST be replaced with the required-field form. The
+protocol version remains 1 because this specification replaces the prior draft
+before it became a supported contract; it does not preserve the draft behavior.
 
 The systemd user service must allow `AF_INET` and `AF_INET6` when sync is
 supported; its current `AF_UNIX`-only sandbox is incompatible with network sync.
@@ -307,6 +390,11 @@ event was skipped. Error logs MUST not contain decrypted content or keys.
 Remote application MUST NOT create an outbox item for the received revision.
 That rule, plus identity deduplication, prevents feedback loops.
 
+Retention-floor advancement and event processing share one cursor namespace.
+After committing a floor, the next accepted event sequence MUST equal the new
+cursor plus one. A later gap without a preceding validated `ready` or
+`history_truncated` message remains a protocol error.
+
 ## 12. Storage changes
 
 The existing revision, inbox, outbox, acknowledgement, and device tables should
@@ -320,6 +408,10 @@ At minimum, storage needs:
 - raw encrypted-event or safe quarantine information in the inbox;
 - inbox processing state and error category;
 - a durable highest contiguous server cursor;
+- an atomic retention-floor operation that advances the cursor without
+  synthesizing inbox rows;
+- durable truncation diagnostics including at least the most recent accepted
+  floor, time, and a cumulative occurrence count;
 - idempotent insertion of remote revisions without assigning a new local origin;
 - deterministic slot-head conflict resolution; and
 - garbage collection that treats pending outbox and inbox data as live roots.
@@ -336,10 +428,19 @@ The database and blob store MUST remain usable while the network worker is
 blocked or reconnecting. No network operation may execute while holding the
 SQLite mutex or an open write transaction.
 
+The retention-floor operation MUST validate the advertised range, refuse to
+move the cursor backward, and persist both the new cursor and truncation
+diagnostics in one transaction. It MUST first account for any already-persisted
+inbox rows at or below the target. A crash before commit leaves the old cursor;
+a crash after commit resumes from the new one. Restart MUST therefore never
+request or wait for an expired prefix again.
+
 ## 13. Conflict resolution and clocks
 
-Every accepted revision is retained as history. The current slot head is chosen
-deterministically using this ordering key:
+Every accepted local or received revision is retained in the client's local
+history, subject to a future local-retention policy. Relay expiration does not
+delete local revisions. The current slot head is chosen deterministically using
+this ordering key:
 
 ```text
 (hlc_physical, hlc_logical, origin_device_id, origin_sequence, revision_id)
@@ -347,7 +448,9 @@ deterministically using this ordering key:
 
 The lexicographically greatest valid key wins. Tombstones use the same ordering
 and receive no unconditional priority. This ensures every device presented with
-the same revision set selects the same head.
+the same revision set selects the same head. Devices that received different
+retained subsets are not guaranteed to converge until a later revision for the
+affected slot reaches all of them.
 
 When receiving a valid remote HLC, the daemon MUST advance its stored HLC using
 the standard receive rule so that the next local event sorts after observed
@@ -378,6 +481,31 @@ not required for server synchronization when the sync worker runs inside
 `kclipd`. If added, it must deliver revision identities and tombstones rather
 than only clipboard text.
 
+### 14.1 Plasma behavior with lossy replay
+
+A retention-floor advance is not a clipboard revision. The Plasma adapter MUST
+NOT clear, write, or re-import the desktop clipboard merely because history was
+truncated. A retained remote revision that becomes the slot head follows the
+normal post-commit notification path and is mirrored to Plasma when
+`slot_to_desktop` is enabled.
+
+If no retained event changes the mirrored slot, the existing local slot and
+desktop value may remain stale. In particular, an expired tombstone cannot be
+reconstructed and MUST NOT be guessed.
+
+When sync and Plasma `desktop_to_slot` are both enabled, the adapter MUST defer
+its one-time startup import until either:
+
+- the initial sync replay reaches the `latest_sequence` advertised by `ready`;
+  or
+- the first connection attempt reaches a stable offline, authentication, or
+  configuration failure state.
+
+This prevents an arbitrary startup clipboard value from defeating a reachable
+retained remote winner, while preserving offline-first behavior. Later desktop
+changes are ordinary local mutations and may legitimately win by HLC order.
+`desktop_to_slot` remains disabled by default.
+
 ## 15. Status and CLI behavior
 
 Daemon status should report at least:
@@ -389,10 +517,16 @@ Daemon status should report at least:
 - oldest pending age;
 - last successful connection and acknowledgement times;
 - local processed server cursor;
+- whether the most recent connection reported truncated history;
+- the most recent accepted retention floor and time;
+- cumulative retention-truncation count;
 - last safe error category; and
 - number of quarantined events.
 
-It MUST NOT return tokens, key material, ciphertext, or decrypted previews.
+It MUST NOT return pairing secrets, key material, ciphertext, or decrypted
+previews.
+History truncation is informational, not a degraded-health error and not an
+action item for the end user.
 
 `kclip copy`, `paste`, `list`, and `clear` retain their offline semantics.
 Network delivery is asynchronous. A successful `copy` means the local revision
@@ -406,33 +540,26 @@ On startup, `kclipd` should:
 1. Open and migrate storage.
 2. Start local IPC immediately.
 3. Recover temporary blobs and incomplete inbox/outbox state.
-4. Start adapters.
-5. Start the sync worker if enabled and validly configured.
+4. Start adapters and the sync worker if enabled and validly configured.
+5. Gate only Plasma's one-time `desktop_to_slot` import as specified in
+   section 14.1; local IPC and all other adapter behavior remain available.
 
 On shutdown, it should stop accepting new network work, finish or cancel
 in-flight requests safely, persist retry state, close the WebSocket, and then
 close storage. Aborted pushes remain pending with the same message IDs.
 
-## 17. Migration from the Python client
+## 17. Clean-break deployment
 
-Migration should be explicit and reversible until validation succeeds:
+The Rust client and PyPasteServer are deployed as a matching sync-v1 pair:
 
-1. Install the Rust release with sync disabled.
-2. Import or reference the existing server URL, access token, and 32-byte key.
-3. Copy secrets atomically into kclip-owned paths with strict permissions.
-4. Verify authentication and decrypt a committed compatibility fixture.
-5. Enable Rust sync and verify bidirectional delivery with another device.
-6. Disable the Python desktop daemon.
-7. Retain a timestamped backup of migrated configuration and secrets according
-   to an explicit user-facing retention policy.
+1. Install versions containing the required rolling-retention contract.
+2. Provision a new Noise pairing through the server administrator.
+3. Generate or import the current account synchronization key through `kclip`.
+4. Enable sync and verify bidirectional delivery with another device.
 
-The migration tool MUST NOT print the mnemonic, raw key, or token unless the
-user invokes a dedicated export operation with an interactive warning.
-
-The first Rust release MAY support only the `default` text slot against the
-legacy endpoint as a temporary compatibility stage. Such a mode must be clearly
-labeled legacy and must not silently discard binary content, other slots, or
-tombstones. The target `/sync/v1` implementation is the acceptance target.
+There is no import of Python-client configuration or bearer tokens, no legacy
+endpoint, and no pre-retention `ready` shape. Existing unsupported clients must
+be removed or independently archived rather than migrated through sync-v1.
 
 ## 18. Required tests
 
@@ -456,6 +583,17 @@ tombstones. The target `/sync/v1` implementation is the acceptance target.
 ### 18.3 Inbox and replay
 
 - Replay from zero and from a nonzero cursor.
+- Truncated `ready` durably skips the expired prefix and begins at the retained
+  floor.
+- An empty retained buffer advances and checkpoints through `latest_sequence`.
+- Active `history_truncated` advances atomically and continues on the same
+  connection.
+- Duplicate and older retention floors are idempotent.
+- Missing fields, inconsistent booleans, invalid ranges, unexpected event gaps,
+  and a cursor ahead of `latest_sequence` are rejected.
+- Restart after accepting a retention floor resumes from the advanced cursor.
+- A gap creates no fake inbox row, revision, HLC change, outbox item, or adapter
+  notification.
 - Duplicate self-echo and cross-connection events are idempotent.
 - Cursor advances only over a contiguous processed prefix.
 - Crash at each inbox processing stage recovers correctly.
@@ -472,12 +610,17 @@ tombstones. The target `/sync/v1` implementation is the acceptance target.
 
 ### 18.5 Operational behavior
 
-- Missing server, invalid TLS, revoked token, wrong key, and offline startup.
+- Missing server, invalid TLS, revoked pairing, wrong key, and offline startup.
 - Bounded retry, queue, and memory behavior.
 - Clean shutdown with pending and in-flight work.
 - Secret-file ownership, permissions, regular-file, and symlink checks.
 - The systemd sandbox permits required network families without weakening
   unrelated filesystem protections.
+- Status reports truncation diagnostics without presenting them as a user
+  repair task.
+- Plasma does not react to a bare retention floor, does react to a retained
+  winning revision, and defers its initial desktop import while reachable
+  replay is incomplete.
 
 ### 18.6 End-to-end
 
@@ -489,7 +632,14 @@ Run two temporary daemons and one real PyPasteServer test instance:
 4. Start device B and replay the revision.
 5. Create a concurrent conflicting revision and confirm convergence.
 6. Clear the slot and confirm both devices converge on the tombstone.
-7. Confirm the server database and logs contain no plaintext or slot names.
+7. Leave device B offline until the events for a different slot and its
+   tombstone expire from the relay.
+8. Reconnect device B, confirm its cursor skips durably to the advertised floor,
+   retained events apply, and the expired slot remains stale without prompting
+   the user.
+9. Advance retention past a connected slow consumer and confirm the active
+   control message is handled without reconnecting.
+10. Confirm the server database and logs contain no plaintext or slot names.
 
 ## 19. Acceptance criteria
 
@@ -501,5 +651,31 @@ The client portion is complete when:
 4. Remote events survive crashes during inbox processing and apply once.
 5. Concurrent revisions converge deterministically.
 6. The server receives only opaque authenticated ciphertext and routing data.
-7. Existing token and mnemonic-derived key material can be migrated safely.
-8. No Python desktop daemon or client CLI is required.
+7. No Python desktop daemon or client CLI is required.
+8. Initial and active retention gaps advance the durable cursor automatically,
+   replay the available suffix, and survive restart.
+9. Expired history never synthesizes clipboard state or triggers Plasma, and
+    no backward-compatible wire path remains.
+
+## 20. Required implementation changes
+
+The implementation should be delivered in these independently testable slices:
+
+1. `kclip-sync` replaces its current `Ready` decoder with the required fields
+   in section 8.1, adds a `HistoryTruncated` server-message variant, validates
+   both message shapes, and removes the guard that assumes
+   `replay_from == resume_after + 1`.
+2. `kclip-storage` adds a migration for truncation metadata and an atomic API to
+   accept a retention floor. The API advances the existing
+   `sync_server_cursor`; it does not insert placeholder inbox records.
+3. The sync receive loop calls that storage API before retained events, emits a
+   checkpoint for a committed gap, and treats active truncation as control flow
+   rather than a connection error.
+4. Daemon status exposes the diagnostics in section 15 and provides the initial
+   replay-complete/offline signal needed for Plasma startup ordering.
+5. The Plasma adapter gates only its initial `desktop_to_slot` reconciliation.
+   Existing post-commit revision notifications remain the mechanism for
+   `slot_to_desktop` updates.
+6. The shared sync wire fixture is replaced, and unit, restart, Plasma, and
+   two-daemon integration tests cover section 18. No old fixture or old-`ready`
+   compatibility test is retained.

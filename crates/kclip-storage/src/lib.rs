@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationOptions {
@@ -69,6 +69,15 @@ pub struct SyncStorageStatus {
     pub server_cursor: u64,
     pub quarantined_events: u64,
     pub last_acknowledged_at: Option<i64>,
+    pub last_retention_floor: Option<u64>,
+    pub last_retention_at: Option<i64>,
+    pub retention_truncation_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionFloorOutcome {
+    Advanced(u64),
+    Unchanged(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,6 +442,35 @@ impl Storage {
         Ok(inserted != 0)
     }
 
+    /// Returns whether the exact encrypted event is already present in the inbox.
+    /// A reused message identity with different immutable data is rejected.
+    pub fn inbox_contains(&self, event: &InboxEvent) -> Result<bool, StorageError> {
+        let connection = self.lock_connection()?;
+        let matches = connection
+            .query_row(
+                "SELECT server_sequence = ?1 AND source_device_id = ?2
+                 AND algorithm = ?3 AND nonce = ?4 AND ciphertext = ?5 AND tag = ?6
+                 AND accepted_at = ?7 FROM inbox WHERE message_id = ?8",
+                params![
+                    i64_from_u64(event.server_sequence, "server sequence")?,
+                    event.source_device_id,
+                    event.algorithm,
+                    event.nonce,
+                    event.ciphertext,
+                    event.tag,
+                    event.accepted_at,
+                    event.message_id,
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        match matches {
+            Some(true) => Ok(true),
+            Some(false) => Err(StorageError::IdentityConflict(event.message_id.clone())),
+            None => Ok(false),
+        }
+    }
+
     pub fn pending_inbox(&self) -> Result<Vec<InboxEvent>, StorageError> {
         let connection = self.lock_connection()?;
         let mut statement = connection.prepare(
@@ -624,6 +662,12 @@ impl Storage {
             connection.query_row("SELECT MAX(acknowledged_at) FROM outbox", [], |row| {
                 row.get(0)
             })?;
+        let last_retention_floor: u64 = metadata_value(&connection, "last_retention_floor")?
+            .parse()
+            .map_err(|_| StorageError::Corrupt("invalid last retention floor".into()))?;
+        let last_retention_at: i64 = metadata_value(&connection, "last_retention_at")?
+            .parse()
+            .map_err(|_| StorageError::Corrupt("invalid last retention time".into()))?;
         Ok(SyncStorageStatus {
             pending_outbox_count: pending_outbox_count as u64,
             oldest_pending_age_millis: oldest.map(|created| now.saturating_sub(created) as u64),
@@ -632,7 +676,65 @@ impl Storage {
                 .map_err(|_| StorageError::Corrupt("invalid sync server cursor".into()))?,
             quarantined_events: quarantined_events as u64,
             last_acknowledged_at,
+            last_retention_floor: (last_retention_floor != 0).then_some(last_retention_floor),
+            last_retention_at: (last_retention_at != 0).then_some(last_retention_at),
+            retention_truncation_count: metadata_value(&connection, "retention_truncation_count")?
+                .parse()
+                .map_err(|_| StorageError::Corrupt("invalid retention truncation count".into()))?,
         })
+    }
+
+    /// Atomically accepts a server retention floor without synthesizing inbox data.
+    pub fn accept_retention_floor(
+        &self,
+        earliest_sequence: u64,
+        latest_sequence: u64,
+    ) -> Result<RetentionFloorOutcome, StorageError> {
+        let upper = latest_sequence.checked_add(1).ok_or_else(|| {
+            StorageError::InvalidRetentionFloor("latest sequence overflow".into())
+        })?;
+        if earliest_sequence == 0 || earliest_sequence > upper {
+            return Err(StorageError::InvalidRetentionFloor(
+                "earliest sequence is outside the advertised range".into(),
+            ));
+        }
+        let target = earliest_sequence - 1;
+        let now = unix_millis()?;
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction()?;
+        let cursor = parse_metadata_u64(&transaction, "sync_server_cursor")?;
+        if target <= cursor {
+            transaction.commit()?;
+            return Ok(RetentionFloorOutcome::Unchanged(cursor));
+        }
+        let pending: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM inbox
+                 WHERE processed_at IS NULL AND server_sequence <= ?1
+             )",
+            [i64_from_u64(target, "retention target")?],
+            |row| row.get(0),
+        )?;
+        if pending {
+            return Err(StorageError::PendingInboxBelowRetentionFloor(target));
+        }
+        let count = parse_metadata_u64(&transaction, "retention_truncation_count")?
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Corrupt("retention truncation count overflow".into()))?;
+        set_metadata(&transaction, "sync_server_cursor", &target.to_string())?;
+        set_metadata(
+            &transaction,
+            "last_retention_floor",
+            &earliest_sequence.to_string(),
+        )?;
+        set_metadata(&transaction, "last_retention_at", &now.to_string())?;
+        set_metadata(
+            &transaction,
+            "retention_truncation_count",
+            &count.to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(RetentionFloorOutcome::Advanced(target))
     }
 
     pub fn device_id(&self) -> Result<String, StorageError> {
@@ -1067,6 +1169,27 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
         )?;
         transaction.commit()?;
     }
+    if current == 2 {
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_retention_floor', '0')",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_retention_at', '0')",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO metadata(key, value) VALUES ('retention_truncation_count', '0')",
+            [],
+        )?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.execute(
+            "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
+            [SCHEMA_VERSION.to_string()],
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -1090,6 +1213,18 @@ fn initialize_metadata(connection: &mut Connection) -> Result<(), StorageError> 
     )?;
     transaction.execute(
         "INSERT OR IGNORE INTO metadata(key, value) VALUES ('sync_server_cursor', '0')",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_retention_floor', '0')",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_retention_at', '0')",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('retention_truncation_count', '0')",
         [],
     )?;
     transaction.commit()?;
@@ -1329,6 +1464,10 @@ pub enum StorageError {
     Corrupt(String),
     #[error("conflicting immutable data for revision or message identity: {0}")]
     IdentityConflict(String),
+    #[error("invalid retention floor: {0}")]
+    InvalidRetentionFloor(String),
+    #[error("pending inbox data exists at or below retention target {0}")]
+    PendingInboxBelowRetentionFloor(u64),
     #[error("storage lock was poisoned")]
     LockPoisoned,
     #[error("system clock is before the Unix epoch")]
@@ -1417,6 +1556,42 @@ mod tests {
             .unwrap();
         assert!(inbox_columns.contains(&"ciphertext".into()));
         assert!(inbox_columns.contains(&"quarantined".into()));
+    }
+
+    #[test]
+    fn version_two_database_adds_retention_metadata_without_moving_its_cursor() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("version-two.db");
+        let mut connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata VALUES ('schema_version', '2');
+                 INSERT INTO metadata VALUES ('sync_server_cursor', '42');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            metadata_value(&connection, "sync_server_cursor").unwrap(),
+            "42"
+        );
+        assert_eq!(
+            metadata_value(&connection, "last_retention_floor").unwrap(),
+            "0"
+        );
+        assert_eq!(
+            metadata_value(&connection, "last_retention_at").unwrap(),
+            "0"
+        );
+        assert_eq!(
+            metadata_value(&connection, "retention_truncation_count").unwrap(),
+            "0"
+        );
     }
 
     #[test]
@@ -1651,5 +1826,69 @@ mod tests {
         let status = storage.sync_status().unwrap();
         assert_eq!(status.server_cursor, 2);
         assert_eq!(status.quarantined_events, 1);
+    }
+
+    #[test]
+    fn retention_floor_advances_atomically_without_synthetic_data_and_survives_restart() {
+        let temp = TempDir::new().unwrap();
+        {
+            let storage = storage(&temp);
+            let local = storage.copy("default", b"unchanged", None).unwrap();
+            let mut revisions = storage.subscribe_revisions();
+            assert_eq!(
+                storage.accept_retention_floor(50, 57).unwrap(),
+                RetentionFloorOutcome::Advanced(49)
+            );
+            assert_eq!(
+                storage.slot_head("default").unwrap().0.revision_id,
+                local.revision_id
+            );
+            assert!(storage.pending_inbox().unwrap().is_empty());
+            assert!(matches!(
+                revisions.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+            let status = storage.sync_status().unwrap();
+            assert_eq!(status.server_cursor, 49);
+            assert_eq!(status.last_retention_floor, Some(50));
+            assert!(status.last_retention_at.is_some());
+            assert_eq!(status.retention_truncation_count, 1);
+            assert_eq!(
+                storage.accept_retention_floor(50, 57).unwrap(),
+                RetentionFloorOutcome::Unchanged(49)
+            );
+            assert_eq!(
+                storage.accept_retention_floor(40, 57).unwrap(),
+                RetentionFloorOutcome::Unchanged(49)
+            );
+            assert_eq!(storage.sync_status().unwrap().retention_truncation_count, 1);
+        }
+        let reopened = storage(&temp);
+        let status = reopened.sync_status().unwrap();
+        assert_eq!(status.server_cursor, 49);
+        assert_eq!(status.last_retention_floor, Some(50));
+        assert_eq!(status.retention_truncation_count, 1);
+    }
+
+    #[test]
+    fn retention_floor_refuses_unprocessed_inbox_and_invalid_ranges() {
+        let temp = TempDir::new().unwrap();
+        let storage = storage(&temp);
+        storage
+            .record_inbox(&inbox("pending", 2, "remote"))
+            .unwrap();
+        assert!(matches!(
+            storage.accept_retention_floor(3, 4),
+            Err(StorageError::PendingInboxBelowRetentionFloor(2))
+        ));
+        assert_eq!(storage.sync_status().unwrap().server_cursor, 0);
+        assert!(matches!(
+            storage.accept_retention_floor(0, 4),
+            Err(StorageError::InvalidRetentionFloor(_))
+        ));
+        assert!(matches!(
+            storage.accept_retention_floor(6, 4),
+            Err(StorageError::InvalidRetentionFloor(_))
+        ));
     }
 }

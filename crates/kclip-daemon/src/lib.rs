@@ -356,6 +356,10 @@ fn process_operation(
                 last_successful_connection: runtime_status.last_successful_connection,
                 last_acknowledgement: sync.last_acknowledged_at,
                 processed_server_cursor: sync.server_cursor,
+                history_truncated: runtime_status.history_truncated,
+                last_retention_floor: sync.last_retention_floor,
+                last_retention_at: sync.last_retention_at,
+                retention_truncation_count: sync.retention_truncation_count,
                 last_sync_error_category: runtime_status.last_error_category.or_else(|| {
                     state
                         .sync_configuration_error

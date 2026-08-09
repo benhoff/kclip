@@ -179,21 +179,26 @@ async fn connected_session(
     let proxy = dbus_call(KlipperProxy::new(&connection)).await?;
     let mut signals = dbus_call(proxy.receive_clipboard_history_updated()).await?;
     let mut pending_write = None;
+    let startup_head = slot_head_revision_id(storage, &configuration.plasma.mirror_slot)?;
 
     let had_head = if configuration.plasma.slot_to_desktop {
         reconcile_to_desktop(storage, configuration, &proxy, &mut pending_write).await?
     } else {
         false
     };
-    if !had_head && configuration.plasma.desktop_to_slot {
-        import_from_desktop(
+    let mut startup_import_pending = !had_head && configuration.plasma.desktop_to_slot;
+    let mut startup_gate = sync_worker.map(WorkerControl::startup_import_ready);
+    if startup_import_pending && startup_gate.as_ref().is_none_or(|gate| *gate.borrow()) {
+        complete_startup_import(
             storage,
             configuration,
             sync_worker,
             &proxy,
             &mut pending_write,
+            startup_head.as_deref(),
         )
         .await?;
+        startup_import_pending = false;
     }
     set_status(status, "connected", None).await;
     debug!("Plasma clipboard adapter connected to Klipper");
@@ -251,7 +256,21 @@ async fn connected_session(
                         &proxy,
                         &mut pending_write,
                     ).await?;
+                    // A signal is a post-startup desktop mutation, not the
+                    // one-time reconciliation value guarded by the replay gate.
+                    startup_import_pending = false;
                 }
+            }
+            _ = wait_for_startup_gate(&mut startup_gate), if startup_import_pending => {
+                complete_startup_import(
+                    storage,
+                    configuration,
+                    sync_worker,
+                    &proxy,
+                    &mut pending_write,
+                    startup_head.as_deref(),
+                ).await?;
+                startup_import_pending = false;
             }
             _ = health.tick() => {
                 if !fdo_call(bus.name_has_owner(BusName::try_from(KLIPPER_SERVICE)?)).await? {
@@ -259,6 +278,45 @@ async fn connected_session(
                 }
             }
         }
+    }
+}
+
+async fn wait_for_startup_gate(gate: &mut Option<watch::Receiver<bool>>) {
+    let Some(gate) = gate else {
+        return;
+    };
+    loop {
+        if *gate.borrow() || gate.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn complete_startup_import(
+    storage: &Storage,
+    configuration: &PlasmaAdapterConfig,
+    sync_worker: Option<&WorkerControl>,
+    proxy: &KlipperProxy<'_>,
+    pending_write: &mut Option<PendingWrite>,
+    startup_head: Option<&str>,
+) -> Result<(), PlasmaError> {
+    let current_head = slot_head_revision_id(storage, &configuration.plasma.mirror_slot)?;
+    if startup_import_superseded(startup_head, current_head.as_deref()) {
+        debug!("skipped Plasma startup import because sync replay changed the slot head");
+        return Ok(());
+    }
+    import_from_desktop(storage, configuration, sync_worker, proxy, pending_write).await
+}
+
+fn startup_import_superseded(startup_head: Option<&str>, current_head: Option<&str>) -> bool {
+    current_head != startup_head
+}
+
+fn slot_head_revision_id(storage: &Storage, slot: &str) -> Result<Option<String>, StorageError> {
+    match storage.slot_head(slot) {
+        Ok((metadata, _)) => Ok(Some(metadata.revision_id)),
+        Err(StorageError::SlotNotFound(_)) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -490,5 +548,28 @@ mod tests {
             desktop_value(&metadata(Some("text/plain"), false), Some(b"")),
             DesktopValue::Unsupported
         );
+    }
+
+    #[tokio::test]
+    async fn startup_import_gate_waits_for_replay_or_offline_signal() {
+        let (ready, receiver) = watch::channel(false);
+        let mut gate = Some(receiver);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), wait_for_startup_gate(&mut gate))
+                .await
+                .is_err()
+        );
+        ready.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(100), wait_for_startup_gate(&mut gate))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn replayed_slot_head_suppresses_only_the_startup_import() {
+        assert!(!startup_import_superseded(None, None));
+        assert!(!startup_import_superseded(Some("local"), Some("local")));
+        assert!(startup_import_superseded(None, Some("remote")));
+        assert!(startup_import_superseded(Some("local"), Some("remote")));
     }
 }

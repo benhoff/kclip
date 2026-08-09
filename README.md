@@ -157,6 +157,13 @@ copy succeeds after the local SQLite transaction commits; it never waits for
 the relay. The outbox retries with the same message ID after daemon, network,
 or server restarts.
 
+PyPasteServer is a bounded rolling relay, not a permanent clipboard backup. If
+a device is offline beyond the retained event window, `kclipd` automatically
+skips the expired prefix, checkpoints the new floor, and applies the available
+suffix without inventing clears or revisions. `kclip status` and
+`kclip sync status` report the latest floor and cumulative truncation count as
+informational diagnostics; no cursor repair is required.
+
 The relay receives routing identifiers and XChaCha20-Poly1305 ciphertext only.
 Slot names, content types, hashes, bytes, tombstones, and revision clocks are
 inside a canonical-CBOR encrypted envelope. A paired client uses

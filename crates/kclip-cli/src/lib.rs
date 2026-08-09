@@ -307,6 +307,18 @@ pub async fn execute_with_runtime(
                 writeln!(output, "authenticated: {}", status.authenticated)?;
                 writeln!(output, "pending outbox: {}", status.pending_outbox_count)?;
                 writeln!(output, "server cursor: {}", status.processed_server_cursor)?;
+                writeln!(output, "history truncated: {}", status.history_truncated)?;
+                if let Some(floor) = status.last_retention_floor {
+                    writeln!(output, "last retention floor: {floor}")?;
+                }
+                if let Some(accepted_at) = status.last_retention_at {
+                    writeln!(output, "last retention time: {accepted_at}")?;
+                }
+                writeln!(
+                    output,
+                    "retention truncations: {}",
+                    status.retention_truncation_count
+                )?;
                 writeln!(
                     output,
                     "quarantined events: {}",
@@ -625,6 +637,10 @@ struct SyncStatusReport {
     last_successful_connection: Option<i64>,
     pending_outbox_count: u64,
     processed_server_cursor: u64,
+    history_truncated: bool,
+    last_retention_floor: Option<u64>,
+    last_retention_at: Option<i64>,
+    retention_truncation_count: u64,
     quarantined_event_count: u64,
     last_error_category: Option<String>,
     next_action: Option<String>,
@@ -721,6 +737,16 @@ async fn execute_sync_status(cli: &Cli, output: &mut dyn Write) -> Result<(), Cl
         processed_server_cursor: daemon
             .as_ref()
             .map_or(0, |status| status.processed_server_cursor),
+        history_truncated: daemon
+            .as_ref()
+            .is_some_and(|status| status.history_truncated),
+        last_retention_floor: daemon
+            .as_ref()
+            .and_then(|status| status.last_retention_floor),
+        last_retention_at: daemon.as_ref().and_then(|status| status.last_retention_at),
+        retention_truncation_count: daemon
+            .as_ref()
+            .map_or(0, |status| status.retention_truncation_count),
         quarantined_event_count: daemon
             .as_ref()
             .map_or(0, |status| status.quarantined_event_count),
@@ -1141,6 +1167,22 @@ fn write_sync_status(
         )?;
         writeln!(
             output,
+            "  history truncated on latest connection: {}",
+            report.history_truncated
+        )?;
+        if let Some(floor) = report.last_retention_floor {
+            writeln!(output, "  last retention floor: {floor}")?;
+        }
+        if let Some(accepted_at) = report.last_retention_at {
+            writeln!(output, "  last retention time: {accepted_at}")?;
+        }
+        writeln!(
+            output,
+            "  retention truncations: {}",
+            report.retention_truncation_count
+        )?;
+        writeln!(
+            output,
             "  quarantined events: {}",
             report.quarantined_event_count
         )?;
@@ -1174,6 +1216,10 @@ fn write_invalid_sync_status(
         last_successful_connection: None,
         pending_outbox_count: 0,
         processed_server_cursor: 0,
+        history_truncated: false,
+        last_retention_floor: None,
+        last_retention_at: None,
+        retention_truncation_count: 0,
         quarantined_event_count: 0,
         last_error_category: Some("invalid_configuration".into()),
         next_action: Some(format!(
@@ -1450,6 +1496,10 @@ mod tests {
             last_successful_connection: None,
             last_acknowledgement: None,
             processed_server_cursor: 0,
+            history_truncated: false,
+            last_retention_floor: None,
+            last_retention_at: None,
+            retention_truncation_count: 0,
             last_sync_error_category: category.map(str::to_owned),
             quarantined_event_count: 0,
             plasma_enabled: false,
@@ -1555,6 +1605,18 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["kclip", "sync", "setup"]).is_ok());
         assert!(Cli::try_parse_from(["kclip", "sync", "status"]).is_ok());
+    }
+
+    #[test]
+    fn retention_history_loss_is_informational_for_sync_health() {
+        let mut status = daemon_status(None);
+        status.synchronization_state = "connected".into();
+        status.authenticated = true;
+        status.history_truncated = true;
+        status.last_retention_floor = Some(50);
+        status.retention_truncation_count = 1;
+        assert!(daemon_sync_ready(&status));
+        assert!(status.last_sync_error_category.is_none());
     }
 
     #[tokio::test]
