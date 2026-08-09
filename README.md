@@ -105,12 +105,12 @@ never corrupt piped clipboard data.
 
 Synchronization is opt-in. Configure `[sync]` in
 [`config/kclip.toml.example`](config/kclip.toml.example), then create or import
-the account key and authenticate:
+the account key and enter the one-time per-device code printed by the server:
 
 ```bash
 kclip key generate                 # new account only
 kclip key import                   # existing account: hidden 24-word mnemonic
-kclip auth register                # or: kclip auth login
+kclip auth pair                    # hidden pairing-code prompt
 systemctl --user restart kclipd
 kclip status
 ```
@@ -123,9 +123,19 @@ or server restarts.
 
 The relay receives routing identifiers and XChaCha20-Poly1305 ciphertext only.
 Slot names, content types, hashes, bytes, tombstones, and revision clocks are
-inside a canonical-CBOR encrypted envelope. Production configuration requires
-`wss://` with platform certificate validation. `ws://` is accepted only with
-the explicit development-only `allow_insecure_transport = true` setting.
+inside a canonical-CBOR encrypted envelope. A paired client uses
+`Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`: both peers contribute ephemeral keys,
+all post-handshake application frames are encrypted and authenticated, and
+Noise counters reject replay or reordering. This permits `ws://` on a trusted
+LAN without sending passwords or bearer tokens. TLS remains recommended for
+Internet exposure because it also hides more metadata and integrates with
+network-edge controls.
+
+The pairing key only protects and authenticates this device's network session.
+The account sync key remains separate and provides end-to-end clipboard
+encryption across devices. Removing the local pairing with `kclip auth logout`
+does not revoke the server copy; revoke its pairing ID with the PyPasteServer
+admin command as well.
 
 Existing PyPasteServer Python credentials can be copied safely into kclip-owned
 paths without printing them:
@@ -151,6 +161,7 @@ Defaults follow the XDG base-directory specification:
 - Configuration: `$XDG_CONFIG_HOME/kclip/config.toml`, falling back to
   `~/.config/kclip/config.toml`
 - Access token: `$XDG_CONFIG_HOME/kclip/token.json`
+- Noise pairing credential: `$XDG_CONFIG_HOME/kclip/pairing.json`
 - Account sync key: `$XDG_DATA_HOME/kclip/sync.key`
 
 The daemon refuses to use an implicit socket when `XDG_RUNTIME_DIR` is missing.

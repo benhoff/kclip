@@ -21,12 +21,14 @@ text_only = true
 
 [sync]
 enabled = false
-relay_url = "wss://clipboard.example.invalid/sync/v1"
+relay_url = "ws://192.168.1.50:8001/sync/v1"
 reconnect_min_delay = "1s"
 reconnect_max_delay = "5m"
 device_name = "workstation"
 # token_path = "/home/example/.config/kclip/token.json"
-# Development tests only. Production relay URLs must use wss://.
+# pairing_path = "/home/example/.config/kclip/pairing.json"
+# Development tests only: allow a legacy bearer token to use ws://. Noise-paired
+# clients do not need this setting.
 allow_insecure_transport = false
 
 [security]

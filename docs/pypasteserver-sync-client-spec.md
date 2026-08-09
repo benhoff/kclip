@@ -35,7 +35,7 @@ The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
 - Giving the server plaintext, slot names, content hashes, or conflict logic.
 - Requiring connectivity for `copy`, `paste`, `list`, or `clear`.
 - Synchronizing revisions marked local-only or slots configured not to sync.
-- Implementing device pairing or key rotation in sync protocol version 1.
+- Rotating the shared account encryption key in sync protocol version 1.
 - Supporting the experimental `/dev/kclip` kernel interface.
 
 ## 4. Target architecture
@@ -82,11 +82,12 @@ representative configuration is:
 ```toml
 [sync]
 enabled = false
-relay_url = "wss://clipboard.example.test/sync/v1"
+relay_url = "ws://192.168.1.50:8001/sync/v1"
 reconnect_min_delay = "1s"
 reconnect_max_delay = "5m"
 device_name = "workstation"
 token_path = "/home/example/.config/kclip/token.json"
+pairing_path = "/home/example/.config/kclip/pairing.json"
 
 [security]
 require_encrypted_sync = true
@@ -99,10 +100,11 @@ sync = true
 Requirements:
 
 - `enabled` defaults to false.
-- An enabled sync configuration MUST require a `wss://` relay unless an
-  explicit development-only insecure override is set.
-- `token_path` and `sync_key_path` MUST resolve through normal XDG defaults when
-  omitted.
+- A Noise-paired client MAY use a `ws://` relay on a trusted LAN. Legacy bearer
+  authentication MUST require `wss://` unless an explicit development-only
+  insecure override is set.
+- `pairing_path`, `token_path`, and `sync_key_path` MUST resolve through normal
+  XDG defaults when omitted.
 - Secret files MUST be owned by the user, MUST be regular non-symlink files,
   and MUST not be accessible by group or other users.
 - The 32-byte sync key MUST NOT be written to logs or status output.
@@ -120,8 +122,7 @@ The Rust `kclip` CLI should provide the end-user account commands needed to
 replace the Python CLI:
 
 ```text
-kclip auth register
-kclip auth login
+kclip auth pair
 kclip auth logout
 kclip auth status
 kclip key generate
@@ -129,11 +130,16 @@ kclip key import
 kclip key export
 ```
 
-Passwords MUST be read interactively or from a deliberately selected secure
-input source, never from a command-line option that appears in process listings.
-Tokens MUST be written atomically with mode `0600` inside a mode `0700`
-directory. Logout MUST revoke the server token when reachable and remove the
-local token on explicit user confirmation or successful revocation.
+`kclip auth pair` MUST read the one-time code through hidden input, validate its
+version, canonical pairing ID, and 32-byte base64url secret, and atomically
+write it with mode `0600` inside a mode `0700` directory. It MUST remove a local
+bearer token after pairing so a handshake failure cannot trigger downgrade.
+Local logout removes the credential but does not revoke the server copy; the
+administrator MUST revoke that pairing ID separately.
+
+Legacy password login and registration may remain for migration, but they MUST
+require TLS. Passwords MUST never appear in command-line options or cross a
+plaintext HTTP connection.
 
 Version 1 uses one 32-byte account synchronization key shared by the user's
 devices. For compatibility, migration MUST support the existing files:
@@ -152,7 +158,7 @@ Generating an unrelated key during login would isolate that device from
 existing ciphertext. The CLI MUST clearly distinguish creating a new account
 key from importing the mnemonic for an existing account.
 
-Pairing, recovery escrow, and key rotation require a later specification.
+Recovery escrow and account-key rotation require a later specification.
 
 ## 8. Server transport
 
@@ -161,14 +167,21 @@ server specification.
 
 Client requirements:
 
-- Authenticate with `Authorization: Bearer <token>`.
+- Prefer the pairing file whenever it exists; an invalid pairing file is a hard
+  credential error and MUST NOT cause bearer fallback.
+- Send `X-Kclip-Transport: noise-psk-v1` and the public pairing ID, then initiate
+  `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` with the device PSK.
+- Encrypt every post-handshake application message as binary chunks matching
+  the companion server specification. Noise transport counters provide strict
+  ordering and replay rejection.
 - Send `hello` before any other message.
 - Persist the server replay cursor locally.
 - Reuse a durable outbox `message_id` on every retry.
 - Accept replay and live `event` messages through one processing path.
 - Tolerate receiving its own uploaded event.
 - Enforce local frame and decoded-field limits even if the server does not.
-- Validate TLS certificates using the platform trust store by default.
+- Validate TLS certificates using the platform trust store whenever `wss` is
+  configured.
 - Never fall back silently from `wss://` to plaintext WebSocket.
 
 The systemd user service must allow `AF_INET` and `AF_INET6` when sync is
