@@ -113,7 +113,6 @@ enabled = true
 mirror_slot = "default"
 desktop_to_slot = false
 slot_to_desktop = true
-text_only = true
 ```
 
 `slot_to_desktop` publishes committed winning revisions to the desktop
@@ -146,10 +145,9 @@ live Noise connection. First-device setup displays 24 recovery words once;
 additional devices enter those same words through hidden input. Use
 `kclip sync status` for an actionable local-and-live checklist.
 
-If setup finds an existing key created before account labels were introduced,
-it shows the requested account and asks for explicit confirmation before
-reusing that key. A real relay or account conflict still stops without changing
-local files.
+Setup reuses an existing account key only when the stored relay and account
+labels match the setup code. An unlabeled key or a real relay/account conflict
+stops without changing local files.
 
 Use `kclip copy --local` for values that must never enter the durable outbox.
 `[slots.NAME] sync = false` enforces the same policy for a whole slot. A normal
@@ -159,7 +157,7 @@ or server restarts.
 
 PyPasteServer is a bounded rolling relay, not a permanent clipboard backup. If
 a device is offline beyond the retained event window, `kclipd` automatically
-skips the expired prefix, checkpoints the new floor, and applies the available
+skips the expired prefix, records the new local cursor, and applies the available
 suffix without inventing clears or revisions. `kclip status` and
 `kclip sync status` report the latest floor and cumulative truncation count as
 informational diagnostics; no cursor repair is required.
@@ -195,6 +193,14 @@ Defaults follow the XDG base-directory specification:
   `~/.config/kclip/config.toml`
 - Noise pairing credential: `$XDG_CONFIG_HOME/kclip/pairing.json`
 - Account sync key: `$XDG_DATA_HOME/kclip/sync.key`
+
+This clean-break release uses client database schema version 4 and does not
+upgrade versions 1 through 3. Archive or remove the old database and blob
+directory before starting the new daemon.
+
+Existing configuration files must also drop the retired history settings,
+`[security]`, `plasma.text_only`, and per-slot `plasma_mirror`; place
+`sync_key_path` in `[sync]`. Unknown retired fields are rejected.
 
 The daemon refuses to use an implicit socket when `XDG_RUNTIME_DIR` is missing.
 Its runtime directory must be owned by the current user and inaccessible to

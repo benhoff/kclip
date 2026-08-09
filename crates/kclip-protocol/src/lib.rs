@@ -9,17 +9,16 @@ pub const DEFAULT_MAX_CONTENT_SIZE: u64 = 10 * 1024 * 1024;
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     pub protocol_version: u16,
-    pub request_id: u64,
     pub operation: Operation,
 }
 
 impl Request {
-    pub fn new(request_id: u64, operation: Operation) -> Self {
+    pub fn new(operation: Operation) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            request_id,
             operation,
         }
     }
@@ -33,7 +32,6 @@ pub enum Operation {
         #[serde(with = "serde_bytes")]
         content: Vec<u8>,
         content_type: Option<String>,
-        #[serde(default)]
         local: bool,
     },
     Paste {
@@ -42,7 +40,6 @@ pub enum Operation {
     List,
     Clear {
         slot: String,
-        #[serde(default)]
         local: bool,
     },
     Status,
@@ -61,26 +58,25 @@ impl Operation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Response {
     pub protocol_version: u16,
-    pub request_id: u64,
-    #[serde(flatten)]
     pub result: ResponseResult,
 }
 
 impl Response {
-    pub fn success(request_id: u64, payload: ResponsePayload) -> Self {
+    pub fn success(payload: ResponsePayload) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            request_id,
-            result: ResponseResult::Success { payload },
+            result: ResponseResult::Success {
+                payload: Box::new(payload),
+            },
         }
     }
 
-    pub fn error(request_id: u64, error: ProtocolError) -> Self {
+    pub fn error(error: ProtocolError) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            request_id,
             result: ResponseResult::Error { error },
         }
     }
@@ -89,21 +85,20 @@ impl Response {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ResponseResult {
-    Success { payload: ResponsePayload },
+    Success { payload: Box<ResponsePayload> },
     Error { error: ProtocolError },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ResponsePayload {
-    Stored(RevisionMetadata),
+    Revision(RevisionMetadata),
     Value {
         metadata: RevisionMetadata,
         #[serde(with = "serde_bytes")]
         content: Vec<u8>,
     },
     Slots(Vec<RevisionMetadata>),
-    Cleared(RevisionMetadata),
     Status(DaemonStatus),
 }
 
@@ -128,45 +123,26 @@ pub struct RevisionMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonStatus {
-    pub daemon_available: bool,
     pub daemon_version: String,
     pub schema_version: u32,
     pub device_id: String,
     pub synchronization_enabled: bool,
-    #[serde(default)]
     pub synchronization_configured: bool,
-    #[serde(default)]
     pub synchronization_state: String,
-    #[serde(default)]
     pub authenticated: bool,
-    #[serde(default)]
     pub credential_error: bool,
-    #[serde(default)]
     pub pending_outbox_count: u64,
-    #[serde(default)]
     pub oldest_pending_age_millis: Option<u64>,
-    #[serde(default)]
     pub last_successful_connection: Option<i64>,
-    #[serde(default)]
     pub last_acknowledgement: Option<i64>,
-    #[serde(default)]
     pub processed_server_cursor: u64,
-    #[serde(default)]
     pub history_truncated: bool,
-    #[serde(default)]
     pub last_retention_floor: Option<u64>,
-    #[serde(default)]
     pub last_retention_at: Option<i64>,
-    #[serde(default)]
     pub retention_truncation_count: u64,
-    #[serde(default)]
     pub last_sync_error_category: Option<String>,
-    #[serde(default)]
     pub quarantined_event_count: u64,
-    pub plasma_enabled: bool,
-    #[serde(default)]
     pub plasma_state: String,
-    #[serde(default)]
     pub last_plasma_error_category: Option<String>,
 }
 
@@ -175,9 +151,6 @@ pub struct DaemonStatus {
 pub struct ProtocolError {
     pub code: ErrorCode,
     pub message: String,
-    pub retryable: bool,
-    pub operation: Option<String>,
-    pub category: Option<String>,
 }
 
 impl ProtocolError {
@@ -185,54 +158,30 @@ impl ProtocolError {
         Self {
             code,
             message: message.into(),
-            retryable: false,
-            operation: None,
-            category: None,
         }
-    }
-
-    pub fn for_operation(mut self, operation: impl Into<String>) -> Self {
-        self.operation = Some(operation.into());
-        self
     }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
-    Generic,
     InvalidRequest,
-    DaemonUnavailable,
     SlotNotFound,
-    RevisionNotFound,
     InvalidSlotName,
     ContentTooLarge,
     StorageFailure,
     PermissionDenied,
-    SynchronizationFailure,
-    AuthenticationFailed,
-    OperationTimedOut,
-    UnsupportedOperation,
-    Conflict,
     ProtocolMismatch,
-    InvalidConfiguration,
 }
 
 impl ErrorCode {
     pub const fn exit_code(self) -> u8 {
         match self {
-            Self::Generic => 1,
-            Self::InvalidRequest | Self::InvalidSlotName | Self::InvalidConfiguration => 2,
-            Self::DaemonUnavailable => 3,
-            Self::SlotNotFound | Self::RevisionNotFound => 4,
+            Self::InvalidRequest | Self::InvalidSlotName => 2,
+            Self::SlotNotFound => 4,
             Self::PermissionDenied => 5,
             Self::ContentTooLarge => 6,
             Self::StorageFailure => 7,
-            Self::SynchronizationFailure => 8,
-            Self::AuthenticationFailed => 9,
-            Self::OperationTimedOut => 10,
-            Self::UnsupportedOperation => 11,
-            Self::Conflict => 12,
             Self::ProtocolMismatch => 1,
         }
     }
@@ -319,6 +268,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_cbor::Value;
+    use std::collections::BTreeMap;
 
     #[test]
     fn slot_validation_enforces_reserved_names_and_byte_limit() {
@@ -334,5 +285,60 @@ mod tests {
         assert_eq!(ErrorCode::SlotNotFound.exit_code(), 4);
         assert_eq!(ErrorCode::ContentTooLarge.exit_code(), 6);
         assert_eq!(ErrorCode::StorageFailure.exit_code(), 7);
+    }
+
+    #[test]
+    fn pre_clean_break_ipc_shapes_are_rejected() {
+        let Value::Map(mut old_request) =
+            serde_cbor::value::to_value(Request::new(Operation::List)).unwrap()
+        else {
+            panic!("request did not serialize as a CBOR map")
+        };
+        old_request.insert(Value::Text("request_id".into()), Value::Integer(42));
+        assert!(serde_cbor::value::from_value::<Request>(Value::Map(old_request)).is_err());
+
+        let current_response = Response::success(ResponsePayload::Slots(Vec::new()));
+        let current_response_value = serde_cbor::value::to_value(&current_response).unwrap();
+        assert_eq!(
+            serde_cbor::value::from_value::<Response>(current_response_value.clone()).unwrap(),
+            current_response
+        );
+        let Value::Map(mut old_response) = current_response_value else {
+            panic!("response did not serialize as a CBOR map")
+        };
+        old_response.insert(Value::Text("request_id".into()), Value::Integer(42));
+        assert!(serde_cbor::value::from_value::<Response>(Value::Map(old_response)).is_err());
+
+        let old_copy = Value::Map(BTreeMap::from([
+            (Value::Text("operation".into()), Value::Text("copy".into())),
+            (
+                Value::Text("payload".into()),
+                Value::Map(BTreeMap::from([
+                    (Value::Text("slot".into()), Value::Text("default".into())),
+                    (Value::Text("content".into()), Value::Bytes(b"old".to_vec())),
+                    (Value::Text("content_type".into()), Value::Null),
+                ])),
+            ),
+        ]));
+        assert!(serde_cbor::value::from_value::<Operation>(old_copy).is_err());
+
+        let old_status = Value::Map(BTreeMap::from([
+            (Value::Text("daemon_available".into()), Value::Bool(true)),
+            (
+                Value::Text("daemon_version".into()),
+                Value::Text("old".into()),
+            ),
+            (Value::Text("schema_version".into()), Value::Integer(3)),
+            (
+                Value::Text("device_id".into()),
+                Value::Text("device".into()),
+            ),
+            (
+                Value::Text("synchronization_enabled".into()),
+                Value::Bool(false),
+            ),
+            (Value::Text("plasma_enabled".into()), Value::Bool(false)),
+        ]));
+        assert!(serde_cbor::value::from_value::<DaemonStatus>(old_status).is_err());
     }
 }

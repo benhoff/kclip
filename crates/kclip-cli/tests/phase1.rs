@@ -223,10 +223,10 @@ async fn concurrent_copies_receive_distinct_revision_ids() {
         },
     );
     let (first, second) = tokio::join!(first, second);
-    let ResponsePayload::Stored(first) = first.unwrap() else {
+    let ResponsePayload::Revision(first) = first.unwrap() else {
         panic!("unexpected response")
     };
-    let ResponsePayload::Stored(second) = second.unwrap() else {
+    let ResponsePayload::Revision(second) = second.unwrap() else {
         panic!("unexpected response")
     };
     assert_ne!(first.revision_id, second.revision_id);
@@ -339,7 +339,7 @@ async fn socket_permissions_are_restrictive() {
 async fn protocol_version_mismatch_returns_a_structured_error() {
     let daemon = TestDaemon::start(1024).await;
     let mut stream = UnixStream::connect(&daemon.socket).await.unwrap();
-    let mut request = Request::new(42, Operation::List);
+    let mut request = Request::new(Operation::List);
     request.protocol_version += 1;
     write_frame(&mut stream, &request).await.unwrap();
     let response: Response = read_frame(&mut stream).await.unwrap();
@@ -420,10 +420,7 @@ async fn offline_relay_never_blocks_local_clipboard_operations() {
     let mut slots = std::collections::BTreeMap::new();
     slots.insert(
         "secret".into(),
-        kclip_config::SlotConfig {
-            sync: Some(false),
-            ..Default::default()
-        },
+        kclip_config::SlotConfig { sync: Some(false) },
     );
     let config = ServerConfig {
         socket_path: socket.clone(),
@@ -433,10 +430,8 @@ async fn offline_relay_never_blocks_local_clipboard_operations() {
         plasma: None,
         sync: kclip_config::SyncResolution::Ready(kclip_config::ResolvedSyncConfig {
             relay_url: "ws://127.0.0.1:1/sync/v1".into(),
-            account_name: "alice".into(),
             reconnect_min_delay: Duration::from_millis(10),
             reconnect_max_delay: Duration::from_millis(50),
-            device_name: "offline-test".into(),
             pairing_path,
             sync_key_path: key_path,
         }),

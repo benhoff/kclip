@@ -165,7 +165,6 @@ where
                     warn!(peer_uid = credentials.uid(), "rejected cross-user local client");
                     let mut stream = stream;
                     let response = Response::error(
-                        0,
                         ProtocolError::new(ErrorCode::PermissionDenied, "client user does not own this daemon"),
                     );
                     let _ = write_frame(&mut stream, &response).await;
@@ -223,38 +222,29 @@ async fn handle_client(
         Ok(request) => request,
         Err(source) => {
             warn!(category = "malformed_frame", error = %source, "rejected malformed IPC frame");
-            let response = Response::error(
-                0,
-                ProtocolError::new(ErrorCode::InvalidRequest, "malformed IPC request"),
-            );
+            let response = Response::error(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "malformed IPC request",
+            ));
             let _ = write_frame(&mut stream, &response).await;
             return Err(ClientError::Frame(source));
         }
     };
     let operation_name = request.operation.name();
-    debug!(
-        request_id = request.request_id,
-        operation = operation_name,
-        "received local request"
-    );
+    debug!(operation = operation_name, "received local request");
 
     if request.protocol_version != PROTOCOL_VERSION {
-        let response = Response::error(
-            request.request_id,
-            ProtocolError::new(
-                ErrorCode::ProtocolMismatch,
-                format!(
-                    "unsupported protocol version {}; expected {}",
-                    request.protocol_version, PROTOCOL_VERSION
-                ),
-            )
-            .for_operation(operation_name),
-        );
+        let response = Response::error(ProtocolError::new(
+            ErrorCode::ProtocolMismatch,
+            format!(
+                "unsupported protocol version {}; expected {}",
+                request.protocol_version, PROTOCOL_VERSION
+            ),
+        ));
         write_frame(&mut stream, &response).await?;
         return Ok(());
     }
 
-    let request_id = request.request_id;
     let operation = request.operation;
     let wakes_sync = matches!(&operation, Operation::Copy { .. } | Operation::Clear { .. });
     let runtime_status = match &state.sync_worker {
@@ -281,8 +271,8 @@ async fn handle_client(
         worker.wake();
     }
     let response = match result {
-        Ok(payload) => Response::success(request_id, payload),
-        Err(error) => Response::error(request_id, error.for_operation(operation_name)),
+        Ok(payload) => Response::success(payload),
+        Err(error) => Response::error(error),
     };
     write_frame(&mut stream, &response).await?;
     Ok(())
@@ -312,7 +302,7 @@ fn process_operation(
                     enqueue_sync: state.should_sync(&slot, local),
                 },
             )
-            .map(ResponsePayload::Stored)
+            .map(ResponsePayload::Revision)
             .map_err(storage_error),
         Operation::Paste { slot } => storage
             .paste(&slot)
@@ -331,12 +321,11 @@ fn process_operation(
                     enqueue_sync: state.should_sync(&slot, local),
                 },
             )
-            .map(ResponsePayload::Cleared)
+            .map(ResponsePayload::Revision)
             .map_err(storage_error),
         Operation::Status => {
             let sync = storage.sync_status().map_err(storage_error)?;
             Ok(ResponsePayload::Status(DaemonStatus {
-                daemon_available: true,
                 daemon_version: DAEMON_VERSION.into(),
                 schema_version: storage.schema_version(),
                 device_id: storage.device_id().map_err(storage_error)?,
@@ -366,7 +355,6 @@ fn process_operation(
                         .then(|| "invalid_configuration".into())
                 }),
                 quarantined_event_count: sync.quarantined_events,
-                plasma_enabled: state.plasma_worker.is_some(),
                 plasma_state: plasma_status.state,
                 last_plasma_error_category: plasma_status.last_error_category,
             }))
@@ -386,24 +374,13 @@ fn storage_error(error: StorageError) -> ProtocolError {
             ErrorCode::ContentTooLarge,
             format!("content size {actual} exceeds configured maximum {maximum}"),
         ),
-        StorageError::LockPoisoned => {
-            let mut error = ProtocolError::new(
-                ErrorCode::StorageFailure,
-                "storage is temporarily unavailable",
-            );
-            error.retryable = true;
-            error.category = Some("lock".into());
-            error
-        }
+        StorageError::LockPoisoned => ProtocolError::new(
+            ErrorCode::StorageFailure,
+            "storage is temporarily unavailable",
+        ),
         _ => {
             error!(category = "storage", error = %error, "storage operation failed");
-            ProtocolError {
-                code: ErrorCode::StorageFailure,
-                message: "local storage operation failed".into(),
-                retryable: false,
-                operation: None,
-                category: Some("storage".into()),
-            }
+            ProtocolError::new(ErrorCode::StorageFailure, "local storage operation failed")
         }
     }
 }

@@ -20,7 +20,6 @@ pub struct Config {
     pub storage: StorageConfig,
     pub plasma: PlasmaConfig,
     pub sync: SyncConfig,
-    pub security: SecurityConfig,
     pub slots: BTreeMap<String, SlotConfig>,
 }
 
@@ -29,9 +28,6 @@ pub struct Config {
 pub struct DaemonConfig {
     pub socket_path: Option<PathBuf>,
     pub max_content_size: Option<u64>,
-    pub history_limit: Option<u32>,
-    pub history_max_age: Option<String>,
-    pub tombstone_retention: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -48,7 +44,6 @@ pub struct PlasmaConfig {
     pub mirror_slot: Option<String>,
     pub desktop_to_slot: bool,
     pub slot_to_desktop: bool,
-    pub text_only: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -61,13 +56,6 @@ pub struct SyncConfig {
     pub reconnect_max_delay: Option<String>,
     pub device_name: Option<String>,
     pub pairing_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SecurityConfig {
-    pub identity_path: Option<PathBuf>,
-    pub require_encrypted_sync: Option<bool>,
     pub sync_key_path: Option<PathBuf>,
 }
 
@@ -75,9 +63,6 @@ pub struct SecurityConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SlotConfig {
     pub sync: Option<bool>,
-    pub history_limit: Option<u32>,
-    pub history_max_age: Option<String>,
-    pub plasma_mirror: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,10 +93,8 @@ pub enum SyncResolution {
 #[derive(Debug, Clone)]
 pub struct ResolvedSyncConfig {
     pub relay_url: String,
-    pub account_name: String,
     pub reconnect_min_delay: Duration,
     pub reconnect_max_delay: Duration,
-    pub device_name: String,
     pub pairing_path: PathBuf,
     pub sync_key_path: PathBuf,
 }
@@ -200,20 +183,10 @@ impl Config {
                 ConfigError::Invalid(format!("invalid plasma mirror slot: {}", error.message))
             })?;
         }
-        for (name, slot) in &self.slots {
+        for name in self.slots.keys() {
             validate_slot_name(name).map_err(|error| {
                 ConfigError::Invalid(format!("invalid configured slot: {}", error.message))
             })?;
-            if slot.history_limit == Some(0) {
-                return Err(ConfigError::Invalid(format!(
-                    "slots.{name}.history_limit must be greater than zero"
-                )));
-            }
-        }
-        if self.daemon.history_limit == Some(0) {
-            return Err(ConfigError::Invalid(
-                "daemon.history_limit must be greater than zero".into(),
-            ));
         }
         Ok(())
     }
@@ -222,12 +195,6 @@ impl Config {
         if !self.plasma.enabled {
             return Ok(None);
         }
-        if !self.plasma.text_only {
-            return Err(ConfigError::Invalid(
-                "plasma.text_only must be true; Klipper D-Bus integration supports text only"
-                    .into(),
-            ));
-        }
         if !self.plasma.desktop_to_slot && !self.plasma.slot_to_desktop {
             return Err(ConfigError::Invalid(
                 "at least one of plasma.desktop_to_slot or plasma.slot_to_desktop must be true"
@@ -235,47 +202,17 @@ impl Config {
             ));
         }
 
-        let marked_slots: Vec<&str> = self
-            .slots
-            .iter()
-            .filter_map(|(name, configuration)| {
-                (configuration.plasma_mirror == Some(true)).then_some(name.as_str())
-            })
-            .collect();
-        if marked_slots.len() > 1 {
-            return Err(ConfigError::Invalid(
-                "only one slot can set plasma_mirror = true".into(),
-            ));
-        }
-        let mirror_slot = match (&self.plasma.mirror_slot, marked_slots.first()) {
-            (Some(configured), Some(marked)) if configured != marked => {
-                return Err(ConfigError::Invalid(format!(
-                    "plasma.mirror_slot ({configured}) conflicts with slots.{marked}.plasma_mirror"
-                )));
-            }
-            (Some(configured), _) => configured.clone(),
-            (None, Some(marked)) => (*marked).to_owned(),
-            (None, None) => {
-                return Err(ConfigError::Invalid(
-                    "plasma.mirror_slot is required when Plasma integration is enabled".into(),
-                ));
-            }
-        };
+        let mirror_slot = self.plasma.mirror_slot.clone().ok_or_else(|| {
+            ConfigError::Invalid(
+                "plasma.mirror_slot is required when Plasma integration is enabled".into(),
+            )
+        })?;
 
         Ok(Some(ResolvedPlasmaConfig {
             mirror_slot,
             desktop_to_slot: self.plasma.desktop_to_slot,
             slot_to_desktop: self.plasma.slot_to_desktop,
         }))
-    }
-
-    pub fn slot_sync_enabled(&self, slot: &str) -> bool {
-        self.sync.enabled
-            && self
-                .slots
-                .get(slot)
-                .and_then(|configuration| configuration.sync)
-                .unwrap_or(true)
     }
 
     pub fn sync_resolution(&self) -> SyncResolution {
@@ -308,11 +245,10 @@ impl Config {
                     "sync.relay_url must be ws:// or wss:// with the exact path /sync/v1 and no credentials, query, or fragment".into(),
                 ));
             }
-            let account_name = self
-                .sync
+            self.sync
                 .account_name
-                .clone()
-                .filter(|value| !value.is_empty())
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| ConfigError::Invalid("sync.account_name is required".into()))?;
 
             let reconnect_min_delay = parse_duration(
@@ -331,15 +267,8 @@ impl Config {
 
             Ok(ResolvedSyncConfig {
                 relay_url: relay_url.to_owned(),
-                account_name,
                 reconnect_min_delay,
                 reconnect_max_delay,
-                device_name: self
-                    .sync
-                    .device_name
-                    .clone()
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or_else(|| "kclip-device".into()),
                 pairing_path: self
                     .sync
                     .pairing_path
@@ -347,7 +276,7 @@ impl Config {
                     .map(Ok)
                     .unwrap_or_else(default_pairing_path)?,
                 sync_key_path: self
-                    .security
+                    .sync
                     .sync_key_path
                     .clone()
                     .map(Ok)
@@ -780,7 +709,6 @@ mod tests {
     const DEFAULTS: &str = r#"
 [daemon]
 max_content_size = 10485760
-history_limit = 10
 
 [storage]
 
@@ -790,12 +718,8 @@ enabled = false
 [sync]
 enabled = false
 
-[security]
-require_encrypted_sync = true
-
 [slots.default]
 sync = true
-history_limit = 10
 "#;
 
     #[test]
@@ -819,7 +743,7 @@ history_limit = 10
     }
 
     #[test]
-    fn resolves_text_only_plasma_mirroring() {
+    fn resolves_plasma_mirroring() {
         let config: Config = toml::from_str(
             r#"
 [plasma]
@@ -827,10 +751,6 @@ enabled = true
 mirror_slot = "default"
 desktop_to_slot = true
 slot_to_desktop = true
-text_only = true
-
-[slots.default]
-plasma_mirror = true
 "#,
         )
         .unwrap();
@@ -852,29 +772,17 @@ plasma_mirror = true
     }
 
     #[test]
-    fn rejects_ambiguous_or_non_text_plasma_configuration() {
+    fn rejects_incomplete_plasma_configuration() {
         for source in [
             r#"
 [plasma]
 enabled = true
-mirror_slot = "default"
 slot_to_desktop = true
-text_only = false
 "#,
             r#"
 [plasma]
 enabled = true
 mirror_slot = "default"
-slot_to_desktop = true
-text_only = true
-[slots.other]
-plasma_mirror = true
-"#,
-            r#"
-[plasma]
-enabled = true
-mirror_slot = "default"
-text_only = true
 "#,
         ] {
             let config: Config = toml::from_str(source).unwrap();
@@ -924,7 +832,6 @@ text_only = true
         };
         let value: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["daemon"]["max_content_size"].as_integer(), Some(42));
-        assert_eq!(value["daemon"]["history_limit"].as_integer(), Some(10));
         assert_eq!(value["slots"]["custom"]["sync"].as_bool(), Some(false));
         assert!(backup_path.is_file());
         assert!(
@@ -965,7 +872,6 @@ text_only = true
 enabled = true
 relay_url = "ws://clipboard.example/sync/v1"
 account_name = "alice"
-[security]
 sync_key_path = "/tmp/key"
 "#,
         )
@@ -1000,7 +906,6 @@ relay_url = "wss://clipboard.example/sync/v1"
 account_name = "alice"
 reconnect_min_delay = "500ms"
 reconnect_max_delay = "2m"
-[security]
 sync_key_path = "/tmp/key"
 "#,
         )

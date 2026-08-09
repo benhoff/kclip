@@ -46,9 +46,5 @@
     "ciphertext": "AA",
     "tag": "AAAAAAAAAAAAAAAAAAAAAA",
     "accepted_at": 1770000000000
-  },
-  "checkpoint": {
-    "type": "checkpoint",
-    "server_sequence": 58
   }
 }

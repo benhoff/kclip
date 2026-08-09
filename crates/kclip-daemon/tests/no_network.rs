@@ -22,6 +22,7 @@ fn phase_one_daemon_opens_only_a_unix_listener() {
             "--data-dir",
             data.to_str().unwrap(),
         ])
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

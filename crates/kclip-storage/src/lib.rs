@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationOptions {
@@ -43,11 +43,9 @@ pub struct StoredRevision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxItem {
-    pub outbox_id: i64,
     pub message_id: String,
     pub revision: StoredRevision,
     pub encrypted_envelope: Option<String>,
-    pub attempt_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +113,6 @@ impl Storage {
              PRAGMA synchronous = FULL;",
         )?;
         apply_migrations(&mut connection)?;
-        initialize_metadata(&mut connection)?;
 
         let blobs = BlobStore::open(blob_directory)?;
         blobs.recover_temporary_files()?;
@@ -292,107 +289,93 @@ impl Storage {
         let rows = {
             let connection = self.lock_connection()?;
             let mut statement = connection.prepare(
-                "SELECT o.outbox_id, o.message_id, o.envelope_path_or_blob,
-                        o.attempt_count, r.revision_id, r.slot_name,
+                "SELECT o.message_id, o.encrypted_envelope,
+                        r.revision_id, r.slot_name,
                         r.origin_device_id, r.origin_sequence, r.hlc_physical,
                         r.hlc_logical, r.content_hash, r.content_size,
                         r.content_type, r.created_at, r.expires_at, r.is_deleted,
                         r.is_local_only, r.source_adapter, r.parent_revision_id
                  FROM outbox o
                  JOIN revisions r ON r.revision_id = o.revision_id
-                 WHERE o.acknowledged_at IS NULL
-                   AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?1)
-                 ORDER BY r.origin_sequence, o.outbox_id
+                 WHERE o.next_attempt_at IS NULL OR o.next_attempt_at <= ?1
+                 ORDER BY r.origin_sequence, o.message_id
                  LIMIT ?2",
             )?;
             let mapped = statement.query_map(
                 params![now, i64::try_from(limit).unwrap_or(i64::MAX)],
                 |row| {
                     Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, i64>(3)? as u32,
-                        revision_from_row_offset(row, 4)?,
-                        row.get::<_, Option<String>>(18)?,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        revision_from_row_offset(row, 2)?,
+                        row.get::<_, Option<String>>(16)?,
                     ))
                 },
             )?;
             mapped.collect::<Result<Vec<_>, _>>()?
         };
         rows.into_iter()
-            .map(
-                |(outbox_id, message_id, encrypted_envelope, attempt_count, metadata, parent)| {
-                    let content = match metadata.content_hash.as_deref() {
-                        Some(hash) => Some(self.blobs.read(hash)?),
-                        None => None,
-                    };
-                    Ok(OutboxItem {
-                        outbox_id,
-                        message_id,
-                        revision: StoredRevision {
-                            metadata,
-                            parent_revision_id: parent,
-                            content,
-                        },
-                        encrypted_envelope,
-                        attempt_count,
-                    })
-                },
-            )
+            .map(|(message_id, encrypted_envelope, metadata, parent)| {
+                let content = match metadata.content_hash.as_deref() {
+                    Some(hash) => Some(self.blobs.read(hash)?),
+                    None => None,
+                };
+                Ok(OutboxItem {
+                    message_id,
+                    revision: StoredRevision {
+                        metadata,
+                        parent_revision_id: parent,
+                        content,
+                    },
+                    encrypted_envelope,
+                })
+            })
             .collect()
     }
 
     pub fn store_outbox_envelope(
         &self,
-        outbox_id: i64,
+        message_id: &str,
         envelope: &str,
     ) -> Result<(), StorageError> {
         let connection = self.lock_connection()?;
-        connection.execute(
-            "UPDATE outbox SET envelope_path_or_blob = COALESCE(envelope_path_or_blob, ?1)
-             WHERE outbox_id = ?2 AND acknowledged_at IS NULL",
-            params![envelope, outbox_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn acknowledge_outbox(
-        &self,
-        message_id: &str,
-        server_sequence: u64,
-    ) -> Result<(), StorageError> {
-        let now = unix_millis()?;
-        let connection = self.lock_connection()?;
         let updated = connection.execute(
-            "UPDATE outbox SET acknowledged_at = ?1, server_sequence = ?2,
-                 last_error = NULL WHERE message_id = ?3",
-            params![
-                now,
-                i64_from_u64(server_sequence, "server sequence")?,
-                message_id
-            ],
+            "UPDATE outbox SET encrypted_envelope = COALESCE(encrypted_envelope, ?1)
+             WHERE message_id = ?2",
+            params![envelope, message_id],
         )?;
         if updated != 1 {
             return Err(StorageError::Corrupt(
-                "acknowledgement references an unknown outbox message".into(),
+                "encrypted envelope references an unknown outbox message".into(),
             ));
         }
         Ok(())
     }
 
-    pub fn fail_outbox(
-        &self,
-        message_id: &str,
-        safe_error: &str,
-        retry_at: i64,
-    ) -> Result<(), StorageError> {
+    pub fn acknowledge_outbox(&self, message_id: &str) -> Result<(), StorageError> {
+        let now = unix_millis()?;
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction()?;
+        let deleted =
+            transaction.execute("DELETE FROM outbox WHERE message_id = ?1", [message_id])?;
+        if deleted != 1 {
+            return Err(StorageError::Corrupt(
+                "acknowledgement references an unknown outbox message".into(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE local_state SET last_acknowledged_at = ?1 WHERE singleton = 1",
+            [now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn fail_outbox(&self, message_id: &str, retry_at: i64) -> Result<(), StorageError> {
         let connection = self.lock_connection()?;
         connection.execute(
-            "UPDATE outbox SET attempt_count = attempt_count + 1,
-                 last_error = ?1, next_attempt_at = ?2
-             WHERE message_id = ?3 AND acknowledged_at IS NULL",
-            params![safe_error, retry_at, message_id],
+            "UPDATE outbox SET next_attempt_at = ?1 WHERE message_id = ?2",
+            params![retry_at, message_id],
         )?;
         Ok(())
     }
@@ -401,15 +384,13 @@ impl Storage {
         let connection = self.lock_connection()?;
         let inserted = connection.execute(
             "INSERT INTO inbox (
-                 message_id, source_device_id, received_at, processed_at,
-                 processing_error, server_sequence, algorithm, nonce,
-                 ciphertext, tag, accepted_at, error_category, quarantined
-             ) VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 0)
+                 message_id, source_device_id, server_sequence, algorithm,
+                 nonce, ciphertext, tag, accepted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(message_id) DO NOTHING",
             params![
                 event.message_id,
                 event.source_device_id,
-                unix_millis()?,
                 i64_from_u64(event.server_sequence, "server sequence")?,
                 event.algorithm,
                 event.nonce,
@@ -442,41 +423,12 @@ impl Storage {
         Ok(inserted != 0)
     }
 
-    /// Returns whether the exact encrypted event is already present in the inbox.
-    /// A reused message identity with different immutable data is rejected.
-    pub fn inbox_contains(&self, event: &InboxEvent) -> Result<bool, StorageError> {
-        let connection = self.lock_connection()?;
-        let matches = connection
-            .query_row(
-                "SELECT server_sequence = ?1 AND source_device_id = ?2
-                 AND algorithm = ?3 AND nonce = ?4 AND ciphertext = ?5 AND tag = ?6
-                 AND accepted_at = ?7 FROM inbox WHERE message_id = ?8",
-                params![
-                    i64_from_u64(event.server_sequence, "server sequence")?,
-                    event.source_device_id,
-                    event.algorithm,
-                    event.nonce,
-                    event.ciphertext,
-                    event.tag,
-                    event.accepted_at,
-                    event.message_id,
-                ],
-                |row| row.get::<_, bool>(0),
-            )
-            .optional()?;
-        match matches {
-            Some(true) => Ok(true),
-            Some(false) => Err(StorageError::IdentityConflict(event.message_id.clone())),
-            None => Ok(false),
-        }
-    }
-
     pub fn pending_inbox(&self) -> Result<Vec<InboxEvent>, StorageError> {
         let connection = self.lock_connection()?;
         let mut statement = connection.prepare(
             "SELECT message_id, server_sequence, source_device_id, algorithm,
                     nonce, ciphertext, tag, accepted_at
-             FROM inbox WHERE processed_at IS NULL ORDER BY server_sequence",
+             FROM inbox ORDER BY server_sequence",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(InboxEvent {
@@ -498,14 +450,22 @@ impl Storage {
         let now = unix_millis()?;
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
+        let server_sequence = pending_inbox_sequence(&transaction, message_id)?;
+        require_next_sequence(&transaction, server_sequence)?;
         transaction.execute(
-            "UPDATE inbox SET processed_at = ?1, processing_error = ?2,
-                 error_category = ?2, quarantined = 1 WHERE message_id = ?3",
-            params![now, category, message_id],
+            "INSERT INTO quarantined_events (
+                 server_sequence, message_id, error_category, quarantined_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                i64_from_u64(server_sequence, "server sequence")?,
+                message_id,
+                category,
+                now,
+            ],
         )?;
-        let cursor = advance_cursor(&transaction)?;
+        complete_inbox(&transaction, message_id, server_sequence)?;
         transaction.commit()?;
-        Ok(cursor)
+        Ok(server_sequence)
     }
 
     pub fn apply_remote_revision(
@@ -526,28 +486,13 @@ impl Storage {
 
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
-        let inbox_pending: bool = transaction
-            .query_row(
-                "SELECT processed_at IS NULL FROM inbox WHERE message_id = ?1",
-                [message_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                StorageError::Corrupt("remote revision has no durable inbox row".into())
-            })?;
-        if !inbox_pending {
-            let cursor = parse_metadata_u64(&transaction, "sync_server_cursor")?;
-            return Ok((RemoteApplyOutcome::Duplicate, cursor));
-        }
+        let server_sequence = pending_inbox_sequence(&transaction, message_id)?;
+        require_next_sequence(&transaction, server_sequence)?;
 
         transaction.execute(
-            "INSERT INTO slots (
-                 slot_name, current_revision_id, sync_policy, history_limit,
-                 history_max_age_seconds, created_at, updated_at
-             ) VALUES (?1, NULL, 'sync', 10, 86400, ?2, ?2)
+            "INSERT INTO slots (slot_name, current_revision_id) VALUES (?1, NULL)
              ON CONFLICT(slot_name) DO NOTHING",
-            params![metadata.slot, metadata.created_at],
+            [metadata.slot.as_str()],
         )?;
 
         let existing = transaction
@@ -584,11 +529,10 @@ impl Storage {
                 "INSERT INTO revisions (
                      revision_id, slot_name, origin_device_id, origin_sequence,
                      hlc_physical, hlc_logical, content_hash, content_size,
-                     content_type, blob_path, created_at, received_at, expires_at,
-                     is_deleted, is_local_only, no_history, source_adapter,
-                     parent_revision_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?7, ?10, ?11,
-                           ?12, ?13, 0, 0, ?14, ?15)",
+                     content_type, created_at, expires_at, is_deleted,
+                     is_local_only, source_adapter, parent_revision_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                           ?12, 0, ?13, ?14)",
                 params![
                     metadata.revision_id,
                     metadata.slot,
@@ -600,7 +544,6 @@ impl Storage {
                     i64_from_u64(metadata.content_size, "content size")?,
                     metadata.content_type,
                     metadata.created_at,
-                    unix_millis()?,
                     metadata.expires_at,
                     metadata.is_deleted,
                     metadata.source_adapter,
@@ -616,17 +559,12 @@ impl Storage {
             .is_none_or(|head| revision_order_key(&metadata) > revision_order_key(head));
         if wins {
             transaction.execute(
-                "UPDATE slots SET current_revision_id = ?1, updated_at = ?2 WHERE slot_name = ?3",
-                params![metadata.revision_id, unix_millis()?, metadata.slot],
+                "UPDATE slots SET current_revision_id = ?1 WHERE slot_name = ?2",
+                params![metadata.revision_id, metadata.slot],
             )?;
         }
         advance_hlc_for_receive(&transaction, metadata.hlc_physical, metadata.hlc_logical)?;
-        transaction.execute(
-            "UPDATE inbox SET processed_at = ?1, processing_error = NULL,
-                 error_category = NULL WHERE message_id = ?2",
-            params![unix_millis()?, message_id],
-        )?;
-        let cursor = advance_cursor(&transaction)?;
+        complete_inbox(&transaction, message_id, server_sequence)?;
         transaction.commit()?;
 
         // A failed transaction can leave a newly written blob unreferenced; startup GC
@@ -642,45 +580,51 @@ impl Storage {
         if outcome == RemoteApplyOutcome::AppliedWinner {
             self.notify_revision(&metadata);
         }
-        Ok((outcome, cursor))
+        Ok((outcome, server_sequence))
     }
 
     pub fn sync_status(&self) -> Result<SyncStorageStatus, StorageError> {
         let now = unix_millis()?;
         let connection = self.lock_connection()?;
-        let (pending_outbox_count, oldest): (i64, Option<i64>) = connection.query_row(
-            "SELECT COUNT(*), MIN(created_at) FROM outbox WHERE acknowledged_at IS NULL",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let quarantined_events: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM inbox WHERE quarantined = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let last_acknowledged_at =
-            connection.query_row("SELECT MAX(acknowledged_at) FROM outbox", [], |row| {
+        let (pending_outbox_count, oldest): (i64, Option<i64>) =
+            connection.query_row("SELECT COUNT(*), MIN(created_at) FROM outbox", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        let quarantined_events: i64 =
+            connection.query_row("SELECT COUNT(*) FROM quarantined_events", [], |row| {
                 row.get(0)
             })?;
-        let last_retention_floor: u64 = metadata_value(&connection, "last_retention_floor")?
-            .parse()
-            .map_err(|_| StorageError::Corrupt("invalid last retention floor".into()))?;
-        let last_retention_at: i64 = metadata_value(&connection, "last_retention_at")?
-            .parse()
-            .map_err(|_| StorageError::Corrupt("invalid last retention time".into()))?;
+        let (
+            server_cursor,
+            last_acknowledged_at,
+            last_retention_floor,
+            last_retention_at,
+            retention_truncation_count,
+        ): (i64, Option<i64>, Option<i64>, Option<i64>, i64) = connection.query_row(
+            "SELECT sync_server_cursor, last_acknowledged_at,
+                        last_retention_floor, last_retention_at,
+                        retention_truncation_count
+                 FROM local_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
         Ok(SyncStorageStatus {
             pending_outbox_count: pending_outbox_count as u64,
             oldest_pending_age_millis: oldest.map(|created| now.saturating_sub(created) as u64),
-            server_cursor: metadata_value(&connection, "sync_server_cursor")?
-                .parse()
-                .map_err(|_| StorageError::Corrupt("invalid sync server cursor".into()))?,
+            server_cursor: server_cursor as u64,
             quarantined_events: quarantined_events as u64,
             last_acknowledged_at,
-            last_retention_floor: (last_retention_floor != 0).then_some(last_retention_floor),
-            last_retention_at: (last_retention_at != 0).then_some(last_retention_at),
-            retention_truncation_count: metadata_value(&connection, "retention_truncation_count")?
-                .parse()
-                .map_err(|_| StorageError::Corrupt("invalid retention truncation count".into()))?,
+            last_retention_floor: last_retention_floor.map(|value| value as u64),
+            last_retention_at,
+            retention_truncation_count: retention_truncation_count as u64,
         })
     }
 
@@ -702,7 +646,13 @@ impl Storage {
         let now = unix_millis()?;
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
-        let cursor = parse_metadata_u64(&transaction, "sync_server_cursor")?;
+        let (cursor, count): (i64, i64) = transaction.query_row(
+            "SELECT sync_server_cursor, retention_truncation_count
+             FROM local_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let cursor = cursor as u64;
         if target <= cursor {
             transaction.commit()?;
             return Ok(RetentionFloorOutcome::Unchanged(cursor));
@@ -710,7 +660,7 @@ impl Storage {
         let pending: bool = transaction.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM inbox
-                 WHERE processed_at IS NULL AND server_sequence <= ?1
+                 WHERE server_sequence <= ?1
              )",
             [i64_from_u64(target, "retention target")?],
             |row| row.get(0),
@@ -718,20 +668,20 @@ impl Storage {
         if pending {
             return Err(StorageError::PendingInboxBelowRetentionFloor(target));
         }
-        let count = parse_metadata_u64(&transaction, "retention_truncation_count")?
+        let count = (count as u64)
             .checked_add(1)
             .ok_or_else(|| StorageError::Corrupt("retention truncation count overflow".into()))?;
-        set_metadata(&transaction, "sync_server_cursor", &target.to_string())?;
-        set_metadata(
-            &transaction,
-            "last_retention_floor",
-            &earliest_sequence.to_string(),
-        )?;
-        set_metadata(&transaction, "last_retention_at", &now.to_string())?;
-        set_metadata(
-            &transaction,
-            "retention_truncation_count",
-            &count.to_string(),
+        transaction.execute(
+            "UPDATE local_state
+             SET sync_server_cursor = ?1, last_retention_floor = ?2,
+                 last_retention_at = ?3, retention_truncation_count = ?4
+             WHERE singleton = 1",
+            params![
+                i64_from_u64(target, "retention target")?,
+                i64_from_u64(earliest_sequence, "earliest sequence")?,
+                now,
+                i64_from_u64(count, "retention truncation count")?,
+            ],
         )?;
         transaction.commit()?;
         Ok(RetentionFloorOutcome::Advanced(target))
@@ -739,7 +689,13 @@ impl Storage {
 
     pub fn device_id(&self) -> Result<String, StorageError> {
         let connection = self.lock_connection()?;
-        metadata_value(&connection, "device_id")
+        connection
+            .query_row(
+                "SELECT device_id FROM local_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
     }
 
     pub fn schema_version(&self) -> u32 {
@@ -896,22 +852,21 @@ fn create_revision(
 ) -> Result<RevisionMetadata, StorageError> {
     let now = unix_millis()?;
     transaction.execute(
-        "INSERT INTO slots (
-             slot_name, current_revision_id, sync_policy, history_limit,
-             history_max_age_seconds, created_at, updated_at
-         ) VALUES (?1, NULL, 'sync', 10, 86400, ?2, ?2)
+        "INSERT INTO slots (slot_name, current_revision_id) VALUES (?1, NULL)
          ON CONFLICT(slot_name) DO NOTHING",
-        params![slot, now],
+        [slot],
     )?;
 
-    let device_id = transaction.query_row(
-        "SELECT value FROM metadata WHERE key = 'device_id'",
+    let (device_id, sequence, last_physical, last_logical): (String, i64, i64, i64) = transaction
+        .query_row(
+        "SELECT device_id, next_origin_sequence, last_hlc_physical,
+                last_hlc_logical
+         FROM local_state WHERE singleton = 1",
         [],
-        |row| row.get::<_, String>(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    let sequence = parse_metadata_u64(transaction, "next_origin_sequence")?;
-    let last_physical = parse_metadata_i64(transaction, "last_hlc_physical")?;
-    let last_logical = parse_metadata_u64(transaction, "last_hlc_logical")?;
+    let sequence = sequence as u64;
+    let last_logical = last_logical as u64;
     let (hlc_physical, hlc_logical) = if now > last_physical {
         (now, 0_u32)
     } else {
@@ -927,12 +882,10 @@ fn create_revision(
         "INSERT INTO revisions (
              revision_id, slot_name, origin_device_id, origin_sequence,
              hlc_physical, hlc_logical, content_hash, content_size,
-             content_type, blob_path, created_at, received_at, expires_at,
-             is_deleted, is_local_only, no_history, source_adapter,
-             parent_revision_id
+             content_type, created_at, expires_at, is_deleted, is_local_only,
+             source_adapter, parent_revision_id
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?7, ?10, ?10, NULL,
-             ?11, ?12, 0, ?13,
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13,
              (SELECT current_revision_id FROM slots WHERE slot_name = ?2)
          )",
         params![
@@ -954,27 +907,31 @@ fn create_revision(
         ],
     )?;
     transaction.execute(
-        "UPDATE slots SET current_revision_id = ?1, updated_at = ?2 WHERE slot_name = ?3",
-        params![revision_id, now, slot],
+        "UPDATE slots SET current_revision_id = ?1 WHERE slot_name = ?2",
+        params![revision_id, slot],
     )?;
     let next_sequence = sequence
         .checked_add(1)
         .ok_or_else(|| StorageError::Corrupt("origin sequence overflow".into()))?;
-    set_metadata(
-        transaction,
-        "next_origin_sequence",
-        &next_sequence.to_string(),
+    transaction.execute(
+        "UPDATE local_state
+         SET next_origin_sequence = ?1, last_hlc_physical = ?2,
+             last_hlc_logical = ?3
+         WHERE singleton = 1",
+        params![
+            i64_from_u64(next_sequence, "origin sequence")?,
+            hlc_physical,
+            hlc_logical,
+        ],
     )?;
-    set_metadata(transaction, "last_hlc_physical", &hlc_physical.to_string())?;
-    set_metadata(transaction, "last_hlc_logical", &hlc_logical.to_string())?;
 
     if options.enqueue_sync && !options.local_only {
         transaction.execute(
             "INSERT INTO outbox (
-                 revision_id, message_id, created_at, next_attempt_at,
-                 attempt_count
-             ) VALUES (?1, ?2, ?3, NULL, 0)",
-            params![revision_id, Uuid::new_v4().to_string(), now],
+                 message_id, revision_id, encrypted_envelope, created_at,
+                 next_attempt_at
+             ) VALUES (?1, ?2, NULL, ?3, NULL)",
+            params![Uuid::new_v4().to_string(), revision_id, now],
         )?;
     }
 
@@ -1030,25 +987,29 @@ fn revision_from_row_offset(
 
 fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
     let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current > SCHEMA_VERSION {
+    if current != 0 && current != SCHEMA_VERSION {
         return Err(StorageError::UnsupportedSchema(current));
     }
     if current == 0 {
         let transaction = connection.transaction()?;
         transaction.execute_batch(
-            "CREATE TABLE metadata (
-                 key TEXT PRIMARY KEY,
-                 value TEXT NOT NULL
+            "CREATE TABLE local_state (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                 device_id TEXT NOT NULL,
+                 next_origin_sequence INTEGER NOT NULL CHECK(next_origin_sequence >= 1),
+                 last_hlc_physical INTEGER NOT NULL,
+                 last_hlc_logical INTEGER NOT NULL CHECK(last_hlc_logical >= 0),
+                 sync_server_cursor INTEGER NOT NULL CHECK(sync_server_cursor >= 0),
+                 last_retention_floor INTEGER CHECK(last_retention_floor >= 1),
+                 last_retention_at INTEGER,
+                 retention_truncation_count INTEGER NOT NULL
+                     CHECK(retention_truncation_count >= 0),
+                 last_acknowledged_at INTEGER
              );
 
              CREATE TABLE slots (
                  slot_name TEXT PRIMARY KEY,
-                 current_revision_id TEXT,
-                 sync_policy TEXT NOT NULL,
-                 history_limit INTEGER NOT NULL,
-                 history_max_age_seconds INTEGER NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
+                 current_revision_id TEXT
              );
 
              CREATE TABLE revisions (
@@ -1061,207 +1022,56 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
                  content_hash TEXT,
                  content_size INTEGER NOT NULL,
                  content_type TEXT,
-                 blob_path TEXT,
                  created_at INTEGER NOT NULL,
-                 received_at INTEGER NOT NULL,
                  expires_at INTEGER,
                  is_deleted INTEGER NOT NULL CHECK(is_deleted IN (0, 1)),
                  is_local_only INTEGER NOT NULL CHECK(is_local_only IN (0, 1)),
-                 no_history INTEGER NOT NULL CHECK(no_history IN (0, 1)),
                  source_adapter TEXT NOT NULL,
                  parent_revision_id TEXT REFERENCES revisions(revision_id),
                  UNIQUE(origin_device_id, origin_sequence)
              );
 
-             CREATE INDEX revisions_slot_created
-                 ON revisions(slot_name, created_at DESC);
              CREATE INDEX revisions_content_hash
                  ON revisions(content_hash) WHERE content_hash IS NOT NULL;
 
-             CREATE TABLE devices (
-                 device_id TEXT PRIMARY KEY,
-                 display_name TEXT NOT NULL,
-                 public_identity_key BLOB,
-                 trust_state TEXT NOT NULL,
-                 paired_at INTEGER,
-                 revoked_at INTEGER,
-                 last_seen_at INTEGER,
-                 last_acknowledged_revision TEXT
-             );
-
              CREATE TABLE outbox (
-                 outbox_id INTEGER PRIMARY KEY,
-                 revision_id TEXT NOT NULL REFERENCES revisions(revision_id),
-                 message_id TEXT NOT NULL UNIQUE,
-                 destination_device_id TEXT,
-                 envelope_path_or_blob TEXT,
+                 message_id TEXT PRIMARY KEY,
+                 revision_id TEXT NOT NULL UNIQUE REFERENCES revisions(revision_id),
+                 encrypted_envelope TEXT,
                  created_at INTEGER NOT NULL,
-                 next_attempt_at INTEGER,
-                 attempt_count INTEGER NOT NULL DEFAULT 0,
-                 last_error TEXT,
-                 server_sequence INTEGER,
-                 acknowledged_at INTEGER
+                 next_attempt_at INTEGER
              );
 
              CREATE TABLE inbox (
                  message_id TEXT PRIMARY KEY,
                  source_device_id TEXT NOT NULL,
-                 received_at INTEGER NOT NULL,
-                 processed_at INTEGER,
-                 processing_error TEXT,
                  server_sequence INTEGER NOT NULL UNIQUE,
                  algorithm TEXT NOT NULL,
                  nonce TEXT NOT NULL,
                  ciphertext TEXT NOT NULL,
                  tag TEXT NOT NULL,
-                 accepted_at INTEGER NOT NULL,
-                 error_category TEXT,
-                 quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0, 1))
+                 accepted_at INTEGER NOT NULL
              );
 
-             CREATE TABLE acknowledgements (
-                 device_id TEXT NOT NULL,
-                 revision_id TEXT NOT NULL,
-                 acknowledged_at INTEGER NOT NULL,
-                 PRIMARY KEY(device_id, revision_id)
-             );
-
-             CREATE TABLE audit_events (
-                 event_id INTEGER PRIMARY KEY,
-                 event_type TEXT NOT NULL,
-                 device_id TEXT,
-                 revision_id TEXT,
-                 created_at INTEGER NOT NULL,
-                 details_json TEXT
+             CREATE TABLE quarantined_events (
+                 server_sequence INTEGER PRIMARY KEY,
+                 message_id TEXT NOT NULL,
+                 error_category TEXT NOT NULL,
+                 quarantined_at INTEGER NOT NULL
              );",
         )?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.execute(
-            "INSERT INTO metadata(key, value) VALUES ('schema_version', ?1)",
-            [SCHEMA_VERSION.to_string()],
-        )?;
-        transaction.commit()?;
-    }
-    if current == 1 {
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(
-            "ALTER TABLE outbox ADD COLUMN message_id TEXT;
-             ALTER TABLE outbox ADD COLUMN server_sequence INTEGER;
-             UPDATE outbox SET message_id = lower(hex(randomblob(16)))
-                 WHERE message_id IS NULL;
-             CREATE UNIQUE INDEX outbox_message_id ON outbox(message_id);
-
-             ALTER TABLE inbox ADD COLUMN server_sequence INTEGER;
-             ALTER TABLE inbox ADD COLUMN algorithm TEXT;
-             ALTER TABLE inbox ADD COLUMN nonce TEXT;
-             ALTER TABLE inbox ADD COLUMN ciphertext TEXT;
-             ALTER TABLE inbox ADD COLUMN tag TEXT;
-             ALTER TABLE inbox ADD COLUMN accepted_at INTEGER;
-             ALTER TABLE inbox ADD COLUMN error_category TEXT;
-             ALTER TABLE inbox ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0;
-             CREATE UNIQUE INDEX inbox_server_sequence ON inbox(server_sequence)
-                 WHERE server_sequence IS NOT NULL;",
+            "INSERT INTO local_state (
+                 singleton, device_id, next_origin_sequence, last_hlc_physical,
+                 last_hlc_logical, sync_server_cursor, last_retention_floor,
+                 last_retention_at, retention_truncation_count,
+                 last_acknowledged_at
+             ) VALUES (1, ?1, 1, 0, 0, 0, NULL, NULL, 0, NULL)",
+            [format!("device-{}", Uuid::new_v4().simple())],
         )?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        transaction.execute(
-            "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
-            [SCHEMA_VERSION.to_string()],
-        )?;
         transaction.commit()?;
     }
-    if current == 2 {
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_retention_floor', '0')",
-            [],
-        )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_retention_at', '0')",
-            [],
-        )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO metadata(key, value) VALUES ('retention_truncation_count', '0')",
-            [],
-        )?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        transaction.execute(
-            "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
-            [SCHEMA_VERSION.to_string()],
-        )?;
-        transaction.commit()?;
-    }
-    Ok(())
-}
-
-fn initialize_metadata(connection: &mut Connection) -> Result<(), StorageError> {
-    let transaction = connection.transaction()?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('device_id', ?1)",
-        [format!("device-{}", Uuid::new_v4().simple())],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('next_origin_sequence', '1')",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_hlc_physical', '0')",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_hlc_logical', '0')",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('sync_server_cursor', '0')",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_retention_floor', '0')",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('last_retention_at', '0')",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('retention_truncation_count', '0')",
-        [],
-    )?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn metadata_value(connection: &Connection, key: &str) -> Result<String, StorageError> {
-    connection
-        .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
-            row.get(0)
-        })
-        .map_err(StorageError::from)
-}
-
-fn parse_metadata_u64(transaction: &Transaction<'_>, key: &str) -> Result<u64, StorageError> {
-    transaction
-        .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
-            row.get::<_, String>(0)
-        })?
-        .parse()
-        .map_err(|_| StorageError::Corrupt(format!("invalid metadata value for {key}")))
-}
-
-fn parse_metadata_i64(transaction: &Transaction<'_>, key: &str) -> Result<i64, StorageError> {
-    transaction
-        .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
-            row.get::<_, String>(0)
-        })?
-        .parse()
-        .map_err(|_| StorageError::Corrupt(format!("invalid metadata value for {key}")))
-}
-
-fn set_metadata(transaction: &Transaction<'_>, key: &str, value: &str) -> Result<(), StorageError> {
-    transaction.execute(
-        "UPDATE metadata SET value = ?1 WHERE key = ?2",
-        params![value, key],
-    )?;
     Ok(())
 }
 
@@ -1361,8 +1171,13 @@ fn advance_hlc_for_receive(
     remote_logical: u32,
 ) -> Result<(), StorageError> {
     let now = unix_millis()?;
-    let local_physical = parse_metadata_i64(transaction, "last_hlc_physical")?;
-    let local_logical = u32::try_from(parse_metadata_u64(transaction, "last_hlc_logical")?)
+    let (local_physical, local_logical): (i64, i64) = transaction.query_row(
+        "SELECT last_hlc_physical, last_hlc_logical
+         FROM local_state WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let local_logical = u32::try_from(local_logical)
         .map_err(|_| StorageError::Corrupt("logical clock overflow".into()))?;
     let physical = now.max(local_physical).max(remote_physical);
     let logical = if physical == local_physical && physical == remote_physical {
@@ -1375,31 +1190,65 @@ fn advance_hlc_for_receive(
         Some(0)
     }
     .ok_or_else(|| StorageError::Corrupt("logical clock overflow".into()))?;
-    set_metadata(transaction, "last_hlc_physical", &physical.to_string())?;
-    set_metadata(transaction, "last_hlc_logical", &logical.to_string())
+    transaction.execute(
+        "UPDATE local_state SET last_hlc_physical = ?1, last_hlc_logical = ?2
+         WHERE singleton = 1",
+        params![physical, logical],
+    )?;
+    Ok(())
 }
 
-fn advance_cursor(transaction: &Transaction<'_>) -> Result<u64, StorageError> {
-    let mut cursor = parse_metadata_u64(transaction, "sync_server_cursor")?;
-    loop {
-        let next = cursor
-            .checked_add(1)
-            .ok_or_else(|| StorageError::Corrupt("server cursor overflow".into()))?;
-        let processed = transaction
-            .query_row(
-                "SELECT processed_at IS NOT NULL FROM inbox WHERE server_sequence = ?1",
-                [i64_from_u64(next, "server sequence")?],
-                |row| row.get::<_, bool>(0),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if !processed {
-            break;
-        }
-        cursor = next;
+fn pending_inbox_sequence(
+    transaction: &Transaction<'_>,
+    message_id: &str,
+) -> Result<u64, StorageError> {
+    transaction
+        .query_row(
+            "SELECT server_sequence FROM inbox WHERE message_id = ?1",
+            [message_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|value| value as u64)
+        .ok_or_else(|| StorageError::Corrupt("remote event has no durable inbox row".into()))
+}
+
+fn require_next_sequence(
+    transaction: &Transaction<'_>,
+    server_sequence: u64,
+) -> Result<(), StorageError> {
+    let cursor: i64 = transaction.query_row(
+        "SELECT sync_server_cursor FROM local_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let expected = (cursor as u64)
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Corrupt("server cursor overflow".into()))?;
+    if server_sequence != expected {
+        return Err(StorageError::Corrupt(
+            "pending inbox event is not contiguous with the server cursor".into(),
+        ));
     }
-    set_metadata(transaction, "sync_server_cursor", &cursor.to_string())?;
-    Ok(cursor)
+    Ok(())
+}
+
+fn complete_inbox(
+    transaction: &Transaction<'_>,
+    message_id: &str,
+    server_sequence: u64,
+) -> Result<(), StorageError> {
+    let deleted = transaction.execute("DELETE FROM inbox WHERE message_id = ?1", [message_id])?;
+    if deleted != 1 {
+        return Err(StorageError::Corrupt(
+            "completed event disappeared from the inbox".into(),
+        ));
+    }
+    transaction.execute(
+        "UPDATE local_state SET sync_server_cursor = ?1 WHERE singleton = 1",
+        [i64_from_u64(server_sequence, "server sequence")?],
+    )?;
+    Ok(())
 }
 
 fn i64_from_u64(value: u64, field: &str) -> Result<i64, StorageError> {
@@ -1458,7 +1307,7 @@ pub enum StorageError {
     Io(#[from] io::Error),
     #[error("invalid storage path: {0}")]
     InvalidPath(String),
-    #[error("database schema version {0} is newer than this daemon supports")]
+    #[error("database schema version {0} is not supported by this clean-break release")]
     UnsupportedSchema(u32),
     #[error("storage metadata is inconsistent: {0}")]
     Corrupt(String),
@@ -1499,99 +1348,45 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        let table_count: u32 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='revisions'",
-                [],
-                |row| row.get(0),
+        let tables: HashSet<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
             )
-            .unwrap();
-        assert_eq!(table_count, 1);
-    }
-
-    #[test]
-    fn version_one_database_is_migrated_without_replacement() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("legacy.db");
-        let mut connection = Connection::open(path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO metadata VALUES ('schema_version', '1');
-                 CREATE TABLE outbox (
-                     outbox_id INTEGER PRIMARY KEY, revision_id TEXT NOT NULL,
-                     destination_device_id TEXT, envelope_path_or_blob TEXT,
-                     created_at INTEGER NOT NULL, next_attempt_at INTEGER,
-                     attempt_count INTEGER NOT NULL DEFAULT 0, last_error TEXT,
-                     acknowledged_at INTEGER
-                 );
-                 CREATE TABLE inbox (
-                     message_id TEXT PRIMARY KEY, source_device_id TEXT NOT NULL,
-                     received_at INTEGER NOT NULL, processed_at INTEGER,
-                     processing_error TEXT
-                 );
-                 PRAGMA user_version = 1;",
-            )
-            .unwrap();
-        apply_migrations(&mut connection).unwrap();
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        let outbox_columns: Vec<String> = connection
-            .prepare("PRAGMA table_info(outbox)")
             .unwrap()
-            .query_map([], |row| row.get(1))
+            .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert!(outbox_columns.contains(&"message_id".into()));
-        assert!(outbox_columns.contains(&"server_sequence".into()));
-        let inbox_columns: Vec<String> = connection
-            .prepare("PRAGMA table_info(inbox)")
-            .unwrap()
-            .query_map([], |row| row.get(1))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(inbox_columns.contains(&"ciphertext".into()));
-        assert!(inbox_columns.contains(&"quarantined".into()));
+        assert_eq!(
+            tables,
+            HashSet::from([
+                "local_state".into(),
+                "slots".into(),
+                "revisions".into(),
+                "outbox".into(),
+                "inbox".into(),
+                "quarantined_events".into(),
+            ])
+        );
     }
 
     #[test]
-    fn version_two_database_adds_retention_metadata_without_moving_its_cursor() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("version-two.db");
-        let mut connection = Connection::open(path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO metadata VALUES ('schema_version', '2');
-                 INSERT INTO metadata VALUES ('sync_server_cursor', '42');
-                 PRAGMA user_version = 2;",
-            )
-            .unwrap();
-        apply_migrations(&mut connection).unwrap();
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(
-            metadata_value(&connection, "sync_server_cursor").unwrap(),
-            "42"
-        );
-        assert_eq!(
-            metadata_value(&connection, "last_retention_floor").unwrap(),
-            "0"
-        );
-        assert_eq!(
-            metadata_value(&connection, "last_retention_at").unwrap(),
-            "0"
-        );
-        assert_eq!(
-            metadata_value(&connection, "retention_truncation_count").unwrap(),
-            "0"
-        );
+    fn pre_clean_break_databases_are_rejected() {
+        for version in [1_u32, 2, 3] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            connection
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            assert!(matches!(
+                apply_migrations(&mut connection),
+                Err(StorageError::UnsupportedSchema(found)) if found == version
+            ));
+            let unchanged: u32 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(unchanged, version);
+        }
     }
 
     #[test]
@@ -1736,6 +1531,34 @@ mod tests {
         assert_eq!(storage.pending_outbox(10).unwrap().len(), 1);
     }
 
+    #[test]
+    fn acknowledgement_deletes_the_transient_outbox_row() {
+        let temp = TempDir::new().unwrap();
+        let storage = storage(&temp);
+        storage
+            .copy_with_options(
+                "default",
+                b"queued",
+                None,
+                MutationOptions {
+                    source_adapter: "cli".into(),
+                    local_only: false,
+                    enqueue_sync: true,
+                },
+            )
+            .unwrap();
+        let message_id = storage.pending_outbox(1).unwrap()[0].message_id.clone();
+        storage.acknowledge_outbox(&message_id).unwrap();
+        assert!(storage.pending_outbox(1).unwrap().is_empty());
+        assert!(
+            storage
+                .sync_status()
+                .unwrap()
+                .last_acknowledged_at
+                .is_some()
+        );
+    }
+
     fn remote_metadata(
         device: &str,
         sequence: u64,
@@ -1805,27 +1628,29 @@ mod tests {
     }
 
     #[test]
-    fn cursor_moves_only_across_a_contiguous_processed_prefix() {
+    fn completed_inbox_rows_are_removed_as_the_cursor_advances() {
         let temp = TempDir::new().unwrap();
         let storage = storage(&temp);
-        storage.record_inbox(&inbox("second", 2, "remote")).unwrap();
+        storage.record_inbox(&inbox("first", 1, "remote")).unwrap();
         storage
             .apply_remote_revision(
-                "second",
-                remote_metadata("remote", 2, 2, b"two"),
+                "first",
+                remote_metadata("remote", 1, 1, b"one"),
                 None,
-                Some(b"two"),
+                Some(b"one"),
             )
             .unwrap();
-        assert_eq!(storage.sync_status().unwrap().server_cursor, 0);
-        storage.record_inbox(&inbox("first", 1, "remote")).unwrap();
+        assert_eq!(storage.sync_status().unwrap().server_cursor, 1);
+        assert!(storage.pending_inbox().unwrap().is_empty());
+        storage.record_inbox(&inbox("second", 2, "remote")).unwrap();
         assert_eq!(
-            storage.quarantine_inbox("first", "cryptography").unwrap(),
+            storage.quarantine_inbox("second", "cryptography").unwrap(),
             2
         );
         let status = storage.sync_status().unwrap();
         assert_eq!(status.server_cursor, 2);
         assert_eq!(status.quarantined_events, 1);
+        assert!(storage.pending_inbox().unwrap().is_empty());
     }
 
     #[test]

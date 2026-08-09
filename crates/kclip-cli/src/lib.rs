@@ -20,13 +20,9 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Command as ProcessCommand,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::net::UnixStream;
-
-static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -233,7 +229,7 @@ pub async fn execute_with_runtime(
                 },
             )
             .await?;
-            let ResponsePayload::Stored(metadata) = response else {
+            let ResponsePayload::Revision(metadata) = response else {
                 return Err(CliError::UnexpectedResponse);
             };
             if cli.json {
@@ -243,10 +239,9 @@ pub async fn execute_with_runtime(
         Command::Paste { slot, file } => {
             let socket = local_socket(cli)?;
             if cli.json && file.is_none() {
-                return Err(CliError::Remote(ProtocolError::new(
-                    ErrorCode::UnsupportedOperation,
-                    "--json for paste requires --file so clipboard bytes remain unmodified",
-                )));
+                return Err(CliError::Usage(
+                    "--json for paste requires --file so clipboard bytes remain unmodified".into(),
+                ));
             }
             let response = send_request(&socket, Operation::Paste { slot: slot.clone() }).await?;
             let ResponsePayload::Value { metadata, content } = response else {
@@ -284,7 +279,7 @@ pub async fn execute_with_runtime(
                 },
             )
             .await?;
-            let ResponsePayload::Cleared(metadata) = response else {
+            let ResponsePayload::Revision(metadata) = response else {
                 return Err(CliError::UnexpectedResponse);
             };
             if cli.json {
@@ -391,7 +386,7 @@ async fn execute_sync_setup(
         .map(Ok)
         .unwrap_or_else(default_pairing_path)?;
     let key_path = config
-        .security
+        .sync
         .sync_key_path
         .clone()
         .map(Ok)
@@ -412,11 +407,7 @@ async fn execute_sync_setup(
         return Err(CliError::Reported(2));
     }
 
-    let unlabeled_existing_key = existing_key.is_some()
-        && configured_account.is_none()
-        && (configured_relay.is_none() || configured_relay == Some(setup.relay_url.as_str()));
     if existing_key.is_some()
-        && !unlabeled_existing_key
         && (configured_relay != Some(setup.relay_url.as_str())
             || configured_account != Some(setup.username.as_str()))
     {
@@ -443,35 +434,6 @@ async fn execute_sync_setup(
     writeln!(output, "Account: {}", setup.username)?;
     writeln!(output, "Device:  {}", setup.device_name)?;
     writeln!(output)?;
-
-    if unlabeled_existing_key {
-        writeln!(
-            output,
-            "An existing account encryption key was found, but it predates account labels."
-        )?;
-        writeln!(
-            output,
-            "Reusing it avoids changing access to existing synchronized history."
-        )?;
-        let confirmation = read_line_prompt(
-            input,
-            output,
-            &format!(
-                "Confirm this key belongs to account {}? [y/N] ",
-                setup.username
-            ),
-            16,
-        )?;
-        if !matches!(confirmation.to_ascii_lowercase().as_str(), "y" | "yes") {
-            writeln!(output, "Setup cancelled; no files were changed.")?;
-            writeln!(
-                output,
-                "Next: run `kclip sync recovery-code` if you need to preserve this unlabelled key."
-            )?;
-            return Err(CliError::Reported(2));
-        }
-        writeln!(output)?;
-    }
 
     let mut new_key = None;
     if existing_key.is_none() {
@@ -558,13 +520,6 @@ async fn execute_sync_setup(
     )?;
 
     writeln!(output)?;
-    if unlabeled_existing_key {
-        writeln!(
-            output,
-            "✓ Existing account encryption key associated with {}",
-            setup.username
-        )?;
-    }
     writeln!(output, "✓ Device credential stored")?;
     writeln!(output, "✓ Synchronization configuration updated")?;
 
@@ -674,7 +629,7 @@ async fn execute_sync_status(cli: &Cli, output: &mut dyn Write) -> Result<(), Cl
         .map(Ok)
         .unwrap_or_else(default_pairing_path)?;
     let key_path = config
-        .security
+        .sync
         .sync_key_path
         .clone()
         .map(Ok)
@@ -782,7 +737,7 @@ fn execute_recovery_code(
     let config_path = default_config_path()?;
     let config = load_optional_config(&config_path)?;
     let key_path = config
-        .security
+        .sync
         .sync_key_path
         .clone()
         .map(Ok)
@@ -1264,18 +1219,17 @@ pub async fn send_request(
     socket: &Path,
     operation: Operation,
 ) -> Result<ResponsePayload, CliError> {
-    let request_id = next_request_id();
-    let request = Request::new(request_id, operation);
+    let request = Request::new(operation);
     let mut stream = UnixStream::connect(socket)
         .await
-        .map_err(|source| CliError::DaemonUnavailable(source.kind()))?;
+        .map_err(|_| CliError::DaemonUnavailable)?;
     write_frame(&mut stream, &request).await?;
     let response: Response = read_frame(&mut stream).await?;
-    if response.protocol_version != PROTOCOL_VERSION || response.request_id != request_id {
+    if response.protocol_version != PROTOCOL_VERSION {
         return Err(CliError::ProtocolMismatch);
     }
     match response.result {
-        ResponseResult::Success { payload } => Ok(payload),
+        ResponseResult::Success { payload } => Ok(*payload),
         ResponseResult::Error { error } => Err(CliError::Remote(error)),
     }
 }
@@ -1307,11 +1261,15 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), CliError> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")
     })?;
+    let mut nonce = [0_u8; 8];
+    getrandom::fill(&mut nonce).map_err(|error| {
+        io::Error::other(format!("could not create temporary file name: {error}"))
+    })?;
     let temporary = parent.join(format!(
-        ".{}.kclip-{}-{}.tmp",
+        ".{}.kclip-{}-{:016x}.tmp",
         file_name.to_string_lossy(),
         std::process::id(),
-        next_request_id()
+        u64::from_ne_bytes(nonce),
     ));
     let result = (|| -> io::Result<()> {
         let mut file = OpenOptions::new()
@@ -1357,19 +1315,12 @@ fn write_human_list(output: &mut dyn Write, slots: &[RevisionMetadata]) -> Resul
     Ok(())
 }
 
-fn next_request_id() -> u64 {
-    let time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    time ^ ((std::process::id() as u64) << 32) ^ REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-}
-
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("command completed with an unhealthy result")]
     Reported(u8),
     #[error("local daemon is unavailable")]
-    DaemonUnavailable(io::ErrorKind),
+    DaemonUnavailable,
     #[error("daemon returned an error: {0}")]
     Remote(ProtocolError),
     #[error("local IPC failed: {0}")]
@@ -1394,7 +1345,7 @@ impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Reported(code) => *code,
-            Self::DaemonUnavailable(_) => 3,
+            Self::DaemonUnavailable => 3,
             Self::Remote(error) => error.code.exit_code(),
             Self::Config(_) => 2,
             Self::Usage(_) => 2,
@@ -1482,7 +1433,6 @@ mod tests {
 
     fn daemon_status(category: Option<&str>) -> DaemonStatus {
         DaemonStatus {
-            daemon_available: true,
             daemon_version: "test".into(),
             schema_version: 1,
             device_id: "device".into(),
@@ -1502,7 +1452,6 @@ mod tests {
             retention_truncation_count: 0,
             last_sync_error_category: category.map(str::to_owned),
             quarantined_event_count: 0,
-            plasma_enabled: false,
             plasma_state: "disabled".into(),
             last_plasma_error_category: None,
         }
@@ -1670,7 +1619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlabeled_existing_key_can_be_explicitly_confirmed_without_migration_steps() {
+    async fn unlabeled_existing_key_is_rejected_without_changes() {
         let _environment = ENVIRONMENT.lock().await;
         let temp = TempDir::new().unwrap();
         let config_home = temp.path().join("config-home");
@@ -1714,7 +1663,7 @@ mod tests {
             statuses: VecDeque::new(),
             delays: 0,
         };
-        let mut decline_input = Cursor::new(b"n\n".to_vec());
+        let mut decline_input = Cursor::new(Vec::new());
         let mut decline_output = Vec::new();
         let declined = execute_with_runtime(
             &cli,
@@ -1728,67 +1677,11 @@ mod tests {
         assert_eq!(fs::read(&config_path).unwrap(), original_config);
         assert_eq!(fs::read(&pairing_path).unwrap(), original_pairing);
         assert_eq!(read_sync_key(&key_path).unwrap(), [6_u8; 32]);
-
-        fs::write(
-            &config_path,
-            "[sync]\nenabled = true\nrelay_url = \"wss://clipboard.example.test/sync/v1\"\naccount_name = \"bob\"\ndevice_name = \"other-account\"\n",
-        )
-        .unwrap();
-        let conflicting_config = fs::read(&config_path).unwrap();
-        let mut conflict_secrets = MockSecrets {
-            values: VecDeque::from([fixture.clone()]),
-        };
-        let mut conflict_runtime = MockRuntime {
-            restart: RestartOutcome::Restarted,
-            statuses: VecDeque::new(),
-            delays: 0,
-        };
-        let mut conflict_input = Cursor::new(Vec::new());
-        let mut conflict_output = Vec::new();
-        let conflict = execute_with_runtime(
-            &cli,
-            &mut conflict_input,
-            &mut conflict_output,
-            &mut conflict_secrets,
-            &mut conflict_runtime,
-        )
-        .await;
-        assert!(matches!(conflict, Err(CliError::Reported(2))));
-        assert_eq!(fs::read(&config_path).unwrap(), conflicting_config);
-        let conflict_output = String::from_utf8(conflict_output).unwrap();
-        assert!(conflict_output.contains("Current account: bob"));
-        assert!(conflict_output.contains("Requested account: alice"));
-        fs::write(&config_path, &original_config).unwrap();
-
-        let mut ready = daemon_status(None);
-        ready.synchronization_state = "connected".into();
-        ready.authenticated = true;
-        let mut confirm_secrets = MockSecrets {
-            values: VecDeque::from([fixture]),
-        };
-        let mut confirm_runtime = MockRuntime {
-            restart: RestartOutcome::Restarted,
-            statuses: VecDeque::from([Some(ready)]),
-            delays: 0,
-        };
-        let mut confirm_input = Cursor::new(b"y\n".to_vec());
-        let mut confirm_output = Vec::new();
-        execute_with_runtime(
-            &cli,
-            &mut confirm_input,
-            &mut confirm_output,
-            &mut confirm_secrets,
-            &mut confirm_runtime,
-        )
-        .await
-        .unwrap();
-        let configured = Config::load(Some(&config_path)).unwrap();
-        assert_eq!(configured.sync.account_name.as_deref(), Some("alice"));
-        assert_eq!(read_sync_key(&key_path).unwrap(), [6_u8; 32]);
-        let output = String::from_utf8(confirm_output).unwrap();
-        assert!(output.contains("predates account labels"));
-        assert!(output.contains("Existing account encryption key associated with alice"));
-        assert!(output.contains("Synchronization is ready."));
+        assert!(
+            String::from_utf8(decline_output)
+                .unwrap()
+                .contains("cannot safely match the existing account encryption key")
+        );
 
         unsafe {
             match old_config {

@@ -52,9 +52,6 @@ pub enum ClientMessage {
         ciphertext: String,
         tag: String,
     },
-    Checkpoint {
-        server_sequence: u64,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,7 +193,6 @@ pub struct RuntimeStatus {
     pub last_successful_connection: Option<i64>,
     pub last_error_category: Option<String>,
     pub history_truncated: bool,
-    pub startup_import_ready: bool,
 }
 
 #[derive(Clone)]
@@ -308,7 +304,6 @@ async fn worker_loop(
             }
             Err(error) => {
                 let _ = startup_import_ready.send(true);
-                status.write().await.startup_import_ready = true;
                 let category = error.category().to_owned();
                 let credential =
                     matches!(error, SyncError::Credentials(_) | SyncError::Authentication);
@@ -409,15 +404,7 @@ async fn connect_once(
             )?;
             if history_truncated {
                 recover_inbox(storage, &key, max_content_size, status).await?;
-                let cursor = accept_retention_floor(storage, earliest_sequence, latest_sequence)?;
-                send_json(
-                    &mut websocket,
-                    &mut wire_security,
-                    &ClientMessage::Checkpoint {
-                        server_sequence: cursor,
-                    },
-                )
-                .await?;
+                accept_retention_floor(storage, earliest_sequence, latest_sequence)?;
             }
             (latest_sequence, history_truncated)
         }
@@ -442,7 +429,6 @@ async fn connect_once(
         current.last_successful_connection = Some(unix_millis()?);
         current.last_error_category = None;
         current.history_truncated = history_truncated;
-        current.startup_import_ready |= replay_complete;
         if replay_complete {
             let _ = startup_import_ready.send(true);
         }
@@ -474,22 +460,8 @@ async fn connect_once(
                         break;
                     }
                     MessageOutcome::PermanentOutboxError(failed) if failed == message_id => break,
-                    MessageOutcome::Checkpoint(cursor) => {
-                        send_json(
-                            &mut websocket,
-                            &mut wire_security,
-                            &ClientMessage::Checkpoint {
-                                server_sequence: cursor,
-                            },
-                        )
-                        .await?;
-                        mark_initial_replay_complete(
-                            status,
-                            startup_import_ready,
-                            cursor,
-                            latest_sequence,
-                        )
-                        .await;
+                    MessageOutcome::CursorAdvanced(cursor) => {
+                        mark_initial_replay_complete(startup_import_ready, cursor, latest_sequence);
                     }
                     _ => {}
                 }
@@ -499,11 +471,10 @@ async fn connect_once(
 
         tokio::select! {
             message = receive_json(&mut websocket, &mut wire_security, max_content_size) => {
-                if let MessageOutcome::Checkpoint(cursor) =
+                if let MessageOutcome::CursorAdvanced(cursor) =
                     handle_server_message(storage, &key, max_content_size, status, message?).await?
                 {
-                    send_json(&mut websocket, &mut wire_security, &ClientMessage::Checkpoint { server_sequence: cursor }).await?;
-                    mark_initial_replay_complete(status, startup_import_ready, cursor, latest_sequence).await;
+                    mark_initial_replay_complete(startup_import_ready, cursor, latest_sequence);
                 }
             }
             _ = wake.notified() => {}
@@ -523,7 +494,7 @@ async fn connect_once(
 
 #[derive(Debug, PartialEq, Eq)]
 enum MessageOutcome {
-    Checkpoint(u64),
+    CursorAdvanced(u64),
     Noop,
     Acknowledged(String),
     PermanentOutboxError(String),
@@ -547,7 +518,7 @@ async fn handle_server_message(
                     "push acknowledgement has an invalid server sequence",
                 ));
             }
-            storage.acknowledge_outbox(&message_id, server_sequence)?;
+            storage.acknowledge_outbox(&message_id)?;
             Ok(MessageOutcome::Acknowledged(message_id))
         }
         ServerMessage::Event {
@@ -572,7 +543,7 @@ async fn handle_server_message(
             };
             let cursor = process_event(storage, key, max_content_size, &event, status).await?;
             debug!(cursor, "synchronization event durably processed");
-            Ok(MessageOutcome::Checkpoint(cursor))
+            Ok(MessageOutcome::CursorAdvanced(cursor))
         }
         ServerMessage::HistoryTruncated {
             protocol_version,
@@ -594,7 +565,7 @@ async fn handle_server_message(
                         earliest_sequence,
                         latest_sequence, "accepted server retention floor"
                     );
-                    Ok(MessageOutcome::Checkpoint(cursor))
+                    Ok(MessageOutcome::CursorAdvanced(cursor))
                 }
                 RetentionFloorOutcome::Unchanged(_) => Ok(MessageOutcome::Noop),
             }
@@ -614,7 +585,7 @@ async fn handle_server_message(
                 } else {
                     i64::MAX
                 };
-                storage.fail_outbox(&message_id, &code, retry_at)?;
+                storage.fail_outbox(&message_id, retry_at)?;
                 if !retryable {
                     status.write().await.last_error_category = Some(code);
                     return Ok(MessageOutcome::PermanentOutboxError(message_id));
@@ -645,13 +616,7 @@ async fn process_event(
         .checked_add(1)
         .ok_or(SyncError::Protocol("server cursor overflow"))?;
     if event.server_sequence < expected {
-        return if storage.inbox_contains(event)? {
-            Ok(cursor)
-        } else {
-            Err(SyncError::Protocol(
-                "event sequence is behind the durable cursor",
-            ))
-        };
+        return Ok(cursor);
     }
     if event.server_sequence > expected {
         return Err(SyncError::Protocol("event sequence is not contiguous"));
@@ -743,14 +708,12 @@ fn accept_retention_floor(
     }
 }
 
-async fn mark_initial_replay_complete(
-    status: &RwLock<RuntimeStatus>,
+fn mark_initial_replay_complete(
     startup_import_ready: &watch::Sender<bool>,
     cursor: u64,
     latest_sequence: u64,
 ) {
     if cursor >= latest_sequence {
-        status.write().await.startup_import_ready = true;
         let _ = startup_import_ready.send(true);
     }
 }
@@ -833,11 +796,6 @@ async fn recover_inbox(
 ) -> Result<(), SyncError> {
     for event in storage.pending_inbox()? {
         validate_outer_event(&event, maximum)?;
-        if !storage.inbox_contains(&event)? {
-            return Err(SyncError::Protocol(
-                "pending inbox event disappeared during recovery",
-            ));
-        }
         apply_recorded_event(storage, key, maximum, &event, status).await?;
     }
     Ok(())
@@ -876,7 +834,7 @@ fn outbox_push(
             item.revision.content.clone(),
         );
         let encrypted = encrypt(key, &envelope)?;
-        storage.store_outbox_envelope(item.outbox_id, &serde_json::to_string(&encrypted)?)?;
+        storage.store_outbox_envelope(&item.message_id, &serde_json::to_string(&encrypted)?)?;
         encrypted
     };
     Ok(ClientMessage::Push {
@@ -1563,7 +1521,7 @@ mod tests {
     fn websocket_json_matches_the_cross_repository_wire_fixture() {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../../fixtures/sync-wire-v1.json")).unwrap();
-        for name in ["hello", "push", "checkpoint"] {
+        for name in ["hello", "push"] {
             let message: ClientMessage = serde_json::from_value(fixture[name].clone()).unwrap();
             assert_eq!(serde_json::to_value(message).unwrap(), fixture[name]);
         }
@@ -1678,7 +1636,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            MessageOutcome::Checkpoint(4)
+            MessageOutcome::CursorAdvanced(4)
         );
         assert!(matches!(
             revisions.try_recv(),
@@ -1715,7 +1673,7 @@ mod tests {
             handle_server_message(&destination, &key, 1024, &status, message)
                 .await
                 .unwrap(),
-            MessageOutcome::Checkpoint(5)
+            MessageOutcome::CursorAdvanced(5)
         );
         assert_eq!(destination.paste("default").unwrap().1, b"retained");
         assert_eq!(
@@ -1747,7 +1705,7 @@ mod tests {
         let key = [33_u8; 32];
         let event = event_from_push(
             outbox_push(&source, &source.pending_outbox(1).unwrap()[0], &key).unwrap(),
-            2,
+            1,
             source.device_id().unwrap(),
         );
         let destination_temp = TempDir::new().unwrap();
@@ -1769,7 +1727,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            MessageOutcome::Checkpoint(4)
+            MessageOutcome::CursorAdvanced(4)
         );
         assert!(destination.pending_inbox().unwrap().is_empty());
         assert_eq!(destination.sync_status().unwrap().server_cursor, 4);
@@ -1855,7 +1813,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::result_large_err)]
-    async fn noise_worker_authenticates_uploads_replays_and_checkpoints() {
+    async fn noise_worker_authenticates_uploads_and_replays() {
         let temp = TempDir::new().unwrap();
         let storage = storage(&temp);
         storage
@@ -1970,8 +1928,6 @@ mod tests {
                 },
             )
             .await;
-            let checkpoint = noise_server_receive(&mut socket, &mut noise).await;
-            assert_eq!(checkpoint, ClientMessage::Checkpoint { server_sequence: 1 });
         });
 
         let control = start_worker(
@@ -1980,8 +1936,6 @@ mod tests {
                 relay_url: format!("ws://{address}/sync/v1"),
                 reconnect_min_delay: Duration::from_millis(10),
                 reconnect_max_delay: Duration::from_millis(50),
-                account_name: "alice".into(),
-                device_name: "test".into(),
                 pairing_path,
                 sync_key_path: key_path,
             },
@@ -2006,7 +1960,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::result_large_err)]
-    async fn noise_worker_checkpoints_empty_initial_and_active_retention_gaps() {
+    async fn noise_worker_accepts_initial_and_active_retention_gaps() {
         let temp = TempDir::new().unwrap();
         let storage = storage(&temp);
         let mut revisions = storage.subscribe_revisions();
@@ -2027,6 +1981,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let (release_relay, relay_release) = tokio::sync::oneshot::channel();
         let relay = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = accept_hdr_async(
@@ -2061,10 +2016,6 @@ mod tests {
                 },
             )
             .await;
-            assert_eq!(
-                noise_server_receive(&mut socket, &mut noise).await,
-                ClientMessage::Checkpoint { server_sequence: 4 }
-            );
             noise_server_send(
                 &mut socket,
                 &mut noise,
@@ -2076,10 +2027,7 @@ mod tests {
                 },
             )
             .await;
-            assert_eq!(
-                noise_server_receive(&mut socket, &mut noise).await,
-                ClientMessage::Checkpoint { server_sequence: 6 }
-            );
+            let _ = relay_release.await;
         });
 
         let control = start_worker(
@@ -2088,18 +2036,18 @@ mod tests {
                 relay_url: format!("ws://{address}/sync/v1"),
                 reconnect_min_delay: Duration::from_millis(10),
                 reconnect_max_delay: Duration::from_millis(50),
-                account_name: "alice".into(),
-                device_name: "retention-test".into(),
                 pairing_path,
                 sync_key_path: key_path,
             },
             1024,
         );
         let startup_ready = control.startup_import_ready();
-        tokio::time::timeout(Duration::from_secs(5), relay)
-            .await
-            .unwrap()
-            .unwrap();
+        for _ in 0..100 {
+            if storage.sync_status().unwrap().server_cursor == 6 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let sync = storage.sync_status().unwrap();
         assert_eq!(sync.server_cursor, 6);
         assert_eq!(sync.last_retention_floor, Some(7));
@@ -2110,5 +2058,10 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
         control.shutdown();
+        let _ = release_relay.send(());
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
