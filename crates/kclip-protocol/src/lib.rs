@@ -156,6 +156,10 @@ pub struct DaemonStatus {
     #[serde(default)]
     pub quarantined_event_count: u64,
     pub plasma_enabled: bool,
+    #[serde(default)]
+    pub plasma_state: String,
+    #[serde(default)]
+    pub last_plasma_error_category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Error)]

@@ -12,7 +12,9 @@ tombstone_retention = "30d"
 # database_path = "/home/example/.local/share/kclip/kclip.db"
 # blob_directory = "/home/example/.local/share/kclip/blobs"
 
-# Plasma remains reserved for a later implementation.
+# Plasma integration uses Klipper's session D-Bus API and currently mirrors
+# non-empty UTF-8 text only. Enabling desktop_to_slot makes desktop clipboard
+# text durable and eligible for synchronization according to the slot policy.
 [plasma]
 enabled = false
 mirror_slot = "default"

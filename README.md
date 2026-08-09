@@ -102,6 +102,32 @@ Copy has no success output by default. Paste to stdout always returns raw stored
 bytes. `paste --json` therefore requires `--file`, ensuring JSON formatting can
 never corrupt piped clipboard data.
 
+## KDE Plasma integration
+
+`kclipd` can mirror one slot through Plasma's Klipper session D-Bus service.
+The integration is opt-in and currently supports non-empty UTF-8 text only:
+
+```toml
+[plasma]
+enabled = true
+mirror_slot = "default"
+desktop_to_slot = false
+slot_to_desktop = true
+text_only = true
+```
+
+`slot_to_desktop` publishes committed winning revisions to the desktop
+clipboard and clears it for tombstones. `desktop_to_slot` imports Klipper
+history updates as durable revisions with `source_adapter = "plasma"`; those
+revisions follow the mirrored slot's normal synchronization policy. Keep that
+direction disabled if ordinary desktop clipboard contents should not be stored
+or synchronized.
+
+The adapter reconnects when Klipper is unavailable or restarted, and a missing
+graphical session does not prevent the daemon or CLI from operating. Images,
+file-manager MIME data, empty live values, and non-UTF-8 content remain in
+`kclip` but are not exported through the text-only Klipper API.
+
 ## Encrypted synchronization
 
 Synchronization is opt-in. On the PyPasteServer host, add a device and copy the
@@ -209,6 +235,6 @@ expiration, and synchronization state.
 - `packaging/systemd` — hardened headless user service
 - `kernel` — unsupported experimental kernel prototype
 
-Pairing/key rotation, history/TTL commands, watch subscriptions, and KDE Plasma
-integration remain later phases. Protocol version 1 deliberately uses one
-shared 32-byte account key and retains every accepted relay event.
+Pairing/key rotation, history/TTL commands, watch subscriptions, and rich-MIME
+desktop integration remain later phases. Protocol version 1 deliberately uses
+one shared 32-byte account key and retains every accepted relay event.

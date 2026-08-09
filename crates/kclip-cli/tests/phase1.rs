@@ -85,6 +85,7 @@ fn server_config(socket: &Path, data: &Path, max_content_size: u64) -> ServerCon
         database_path: data.join("kclip.db"),
         blob_directory: data.join("blobs"),
         max_content_size,
+        plasma: None,
         sync: kclip_config::SyncResolution::Disabled,
         slots: Default::default(),
     }
@@ -429,6 +430,7 @@ async fn offline_relay_never_blocks_local_clipboard_operations() {
         database_path: data.join("kclip.db"),
         blob_directory: data.join("blobs"),
         max_content_size: 1024,
+        plasma: None,
         sync: kclip_config::SyncResolution::Ready(kclip_config::ResolvedSyncConfig {
             relay_url: "ws://127.0.0.1:1/sync/v1".into(),
             account_name: "alice".into(),

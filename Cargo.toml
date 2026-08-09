@@ -41,3 +41,4 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 url = "2.5.4"
+zbus = { version = "5.18.0", default-features = false, features = ["tokio"] }

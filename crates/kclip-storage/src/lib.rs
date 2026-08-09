@@ -12,6 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u32 = 2;
@@ -81,6 +82,7 @@ pub struct Storage {
     connection: Mutex<Connection>,
     blobs: BlobStore,
     max_content_size: u64,
+    revision_events: broadcast::Sender<RevisionMetadata>,
 }
 
 impl Storage {
@@ -109,10 +111,12 @@ impl Storage {
         let blobs = BlobStore::open(blob_directory)?;
         blobs.recover_temporary_files()?;
 
+        let (revision_events, _) = broadcast::channel(128);
         let storage = Self {
             connection: Mutex::new(connection),
             blobs,
             max_content_size,
+            revision_events,
         };
         storage.garbage_collect_unreferenced_blobs()?;
         Ok(storage)
@@ -159,6 +163,7 @@ impl Storage {
             &options,
         )?;
         transaction.commit()?;
+        self.notify_revision(&metadata);
         Ok(metadata)
     }
 
@@ -214,6 +219,47 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    /// Returns the current slot head, including tombstones, and its content
+    /// when the head is live.
+    pub fn slot_head(
+        &self,
+        slot: &str,
+    ) -> Result<(RevisionMetadata, Option<Vec<u8>>), StorageError> {
+        validate_slot(slot)?;
+        let metadata = {
+            let connection = self.lock_connection()?;
+            connection
+                .query_row(
+                    "SELECT r.revision_id, r.slot_name, r.origin_device_id,
+                            r.origin_sequence, r.hlc_physical, r.hlc_logical,
+                            r.content_hash, r.content_size, r.content_type,
+                            r.created_at, r.expires_at, r.is_deleted,
+                            r.is_local_only, r.source_adapter
+                     FROM slots s
+                     JOIN revisions r ON r.revision_id = s.current_revision_id
+                     WHERE s.slot_name = ?1",
+                    [slot],
+                    revision_from_row,
+                )
+                .optional()?
+                .ok_or_else(|| StorageError::SlotNotFound(slot.to_owned()))?
+        };
+        if metadata.is_deleted {
+            return Ok((metadata, None));
+        }
+        let hash = metadata
+            .content_hash
+            .as_deref()
+            .ok_or_else(|| StorageError::Corrupt("live revision has no content hash".into()))?;
+        let content = self.blobs.read(hash)?;
+        if content.len() as u64 != metadata.content_size {
+            return Err(StorageError::Corrupt(
+                "blob size does not match revision metadata".into(),
+            ));
+        }
+        Ok((metadata, Some(content)))
+    }
+
     pub fn clear(&self, slot: &str) -> Result<RevisionMetadata, StorageError> {
         self.clear_with_options(slot, MutationOptions::default())
     }
@@ -228,6 +274,7 @@ impl Storage {
         let transaction = connection.transaction()?;
         let metadata = create_revision(&transaction, slot, None, 0, None, true, &options)?;
         transaction.commit()?;
+        self.notify_revision(&metadata);
         Ok(metadata)
     }
 
@@ -554,6 +601,9 @@ impl Storage {
         } else {
             RemoteApplyOutcome::AppliedHistory
         };
+        if outcome == RemoteApplyOutcome::AppliedWinner {
+            self.notify_revision(&metadata);
+        }
         Ok((outcome, cursor))
     }
 
@@ -598,6 +648,10 @@ impl Storage {
         self.blobs.directory()
     }
 
+    pub fn subscribe_revisions(&self) -> broadcast::Receiver<RevisionMetadata> {
+        self.revision_events.subscribe()
+    }
+
     pub fn garbage_collect_unreferenced_blobs(&self) -> Result<usize, StorageError> {
         let referenced = {
             let connection = self.lock_connection()?;
@@ -614,6 +668,10 @@ impl Storage {
         self.connection
             .lock()
             .map_err(|_| StorageError::LockPoisoned)
+    }
+
+    fn notify_revision(&self, metadata: &RevisionMetadata) {
+        let _ = self.revision_events.send(metadata.clone());
     }
 }
 
@@ -1404,6 +1462,47 @@ mod tests {
             Err(StorageError::SlotNotFound(_))
         ));
         assert_eq!(storage.paste("two").unwrap().1, b"2");
+        let (head, content) = storage.slot_head("one").unwrap();
+        assert!(head.is_deleted);
+        assert!(content.is_none());
+    }
+
+    #[test]
+    fn revision_notifications_are_post_commit_and_only_include_winning_heads() {
+        let temp = TempDir::new().unwrap();
+        let storage = storage(&temp);
+        let mut revisions = storage.subscribe_revisions();
+
+        let local = storage.copy("default", b"local", None).unwrap();
+        assert_eq!(revisions.try_recv().unwrap().revision_id, local.revision_id);
+
+        storage.record_inbox(&inbox("loser", 1, "remote")).unwrap();
+        let loser = remote_metadata("remote", 1, 1, b"old");
+        assert_eq!(
+            storage
+                .apply_remote_revision("loser", loser, None, Some(b"old"))
+                .unwrap()
+                .0,
+            RemoteApplyOutcome::AppliedHistory
+        );
+        assert!(matches!(
+            revisions.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        storage.record_inbox(&inbox("winner", 2, "remote")).unwrap();
+        let winner = remote_metadata("remote", 2, unix_millis().unwrap() + 10_000, b"new");
+        assert_eq!(
+            storage
+                .apply_remote_revision("winner", winner.clone(), None, Some(b"new"))
+                .unwrap()
+                .0,
+            RemoteApplyOutcome::AppliedWinner
+        );
+        assert_eq!(
+            revisions.try_recv().unwrap().revision_id,
+            winner.revision_id
+        );
     }
 
     #[test]

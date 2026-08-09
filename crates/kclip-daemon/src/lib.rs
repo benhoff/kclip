@@ -1,4 +1,6 @@
-use kclip_config::{SlotConfig, SyncResolution};
+mod plasma;
+
+use kclip_config::{ResolvedPlasmaConfig, SlotConfig, SyncResolution};
 use kclip_protocol::{
     DaemonStatus, ErrorCode, FrameError, Operation, PROTOCOL_VERSION, ProtocolError, Request,
     Response, ResponsePayload, read_frame_with_limit, write_frame,
@@ -22,6 +24,8 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
+use plasma::{PlasmaAdapterConfig, PlasmaControl, PlasmaRuntimeStatus};
+
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone)]
@@ -30,12 +34,14 @@ pub struct ServerConfig {
     pub database_path: PathBuf,
     pub blob_directory: PathBuf,
     pub max_content_size: u64,
+    pub plasma: Option<ResolvedPlasmaConfig>,
     pub sync: SyncResolution,
     pub slots: BTreeMap<String, SlotConfig>,
 }
 
 struct DaemonState {
     storage: Arc<Storage>,
+    plasma_worker: Option<PlasmaControl>,
     sync_worker: Option<WorkerControl>,
     synchronization_configured: bool,
     synchronization_enabled: bool,
@@ -95,8 +101,25 @@ where
             false,
         ),
     };
+    let plasma_worker = config.plasma.map(|plasma| {
+        let enqueue_sync = synchronization_enabled
+            && config
+                .slots
+                .get(&plasma.mirror_slot)
+                .and_then(|slot| slot.sync)
+                .unwrap_or(true);
+        plasma::start_worker(
+            Arc::clone(&storage),
+            PlasmaAdapterConfig {
+                plasma,
+                enqueue_sync,
+            },
+            sync_worker.clone(),
+        )
+    });
     let state = Arc::new(DaemonState {
         storage,
+        plasma_worker,
         sync_worker,
         synchronization_configured,
         synchronization_enabled,
@@ -165,6 +188,9 @@ where
     }
 
     drop(listener);
+    if let Some(worker) = &state.plasma_worker {
+        worker.shutdown();
+    }
     if let Some(worker) = &state.sync_worker {
         worker.shutdown();
     }
@@ -177,6 +203,11 @@ where
         && !worker.wait_stopped(std::time::Duration::from_secs(2)).await
     {
         warn!("synchronization worker did not stop before shutdown deadline");
+    }
+    if let Some(worker) = &state.plasma_worker
+        && !worker.wait_stopped(std::time::Duration::from_secs(2)).await
+    {
+        warn!("Plasma adapter did not stop before shutdown deadline");
     }
     drop(socket_guard);
     info!("kclipd stopped");
@@ -230,11 +261,19 @@ async fn handle_client(
         Some(worker) => worker.status().await,
         None => RuntimeStatus::default(),
     };
+    let plasma_status = match &state.plasma_worker {
+        Some(worker) => worker.status().await,
+        None => PlasmaRuntimeStatus {
+            state: "disabled".into(),
+            last_error_category: None,
+        },
+    };
     let worker = state.sync_worker.clone();
-    let result =
-        tokio::task::spawn_blocking(move || process_operation(&state, operation, runtime_status))
-            .await
-            .map_err(ClientError::Task)?;
+    let result = tokio::task::spawn_blocking(move || {
+        process_operation(&state, operation, runtime_status, plasma_status)
+    })
+    .await
+    .map_err(ClientError::Task)?;
     if result.is_ok()
         && wakes_sync
         && let Some(worker) = worker
@@ -253,6 +292,7 @@ fn process_operation(
     state: &DaemonState,
     operation: Operation,
     runtime_status: RuntimeStatus,
+    plasma_status: PlasmaRuntimeStatus,
 ) -> Result<ResponsePayload, ProtocolError> {
     let storage = &state.storage;
     match operation {
@@ -322,7 +362,9 @@ fn process_operation(
                         .then(|| "invalid_configuration".into())
                 }),
                 quarantined_event_count: sync.quarantined_events,
-                plasma_enabled: false,
+                plasma_enabled: state.plasma_worker.is_some(),
+                plasma_state: plasma_status.state,
+                last_plasma_error_category: plasma_status.last_error_category,
             }))
         }
     }

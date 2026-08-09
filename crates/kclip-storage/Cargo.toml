@@ -10,6 +10,7 @@ kclip-protocol = { path = "../kclip-protocol" }
 rusqlite.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

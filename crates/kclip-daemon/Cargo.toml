@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+futures-util.workspace = true
 kclip-config = { path = "../kclip-config" }
 kclip-protocol = { path = "../kclip-protocol" }
 kclip-storage = { path = "../kclip-storage" }
@@ -24,6 +25,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zbus.workspace = true
 
 [dev-dependencies]
 serde_cbor.workspace = true

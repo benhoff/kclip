@@ -76,6 +76,7 @@ async fn main() {
             database_path: resolved.database_path,
             blob_directory: resolved.blob_directory,
             max_content_size: resolved.max_content_size,
+            plasma: resolved.plasma,
             sync: resolved.sync,
             slots: resolved.slots,
         };

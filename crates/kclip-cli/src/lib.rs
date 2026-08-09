@@ -302,6 +302,7 @@ pub async fn execute_with_runtime(
             } else {
                 writeln!(output, "daemon: available ({})", status.daemon_version)?;
                 writeln!(output, "device: {}", status.device_id)?;
+                writeln!(output, "plasma: {}", status.plasma_state)?;
                 writeln!(output, "sync: {}", status.synchronization_state)?;
                 writeln!(output, "authenticated: {}", status.authenticated)?;
                 writeln!(output, "pending outbox: {}", status.pending_outbox_count)?;
@@ -313,6 +314,9 @@ pub async fn execute_with_runtime(
                 )?;
                 if let Some(category) = status.last_sync_error_category {
                     writeln!(output, "last sync error: {category}")?;
+                }
+                if let Some(category) = status.last_plasma_error_category {
+                    writeln!(output, "last plasma error: {category}")?;
                 }
             }
         }
@@ -1368,6 +1372,8 @@ mod tests {
             last_sync_error_category: category.map(str::to_owned),
             quarantined_event_count: 0,
             plasma_enabled: false,
+            plasma_state: "disabled".into(),
+            last_plasma_error_category: None,
         }
     }
 

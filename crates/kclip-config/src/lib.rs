@@ -86,8 +86,16 @@ pub struct ResolvedConfig {
     pub database_path: PathBuf,
     pub blob_directory: PathBuf,
     pub max_content_size: u64,
+    pub plasma: Option<ResolvedPlasmaConfig>,
     pub sync: SyncResolution,
     pub slots: BTreeMap<String, SlotConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPlasmaConfig {
+    pub mirror_slot: String,
+    pub desktop_to_slot: bool,
+    pub slot_to_desktop: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +181,7 @@ impl Config {
             database_path,
             blob_directory,
             max_content_size,
+            plasma: self.resolve_plasma()?,
             sync: self.resolve_sync(),
             slots: self.slots.clone(),
         })
@@ -186,11 +195,6 @@ impl Config {
     }
 
     pub fn validate_phase_one(&self) -> Result<(), ConfigError> {
-        if self.plasma.enabled {
-            return Err(ConfigError::Invalid(
-                "Plasma integration is not available in Phase 1; set plasma.enabled = false".into(),
-            ));
-        }
         if let Some(slot) = &self.plasma.mirror_slot {
             validate_slot_name(slot).map_err(|error| {
                 ConfigError::Invalid(format!("invalid plasma mirror slot: {}", error.message))
@@ -212,6 +216,57 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    fn resolve_plasma(&self) -> Result<Option<ResolvedPlasmaConfig>, ConfigError> {
+        if !self.plasma.enabled {
+            return Ok(None);
+        }
+        if !self.plasma.text_only {
+            return Err(ConfigError::Invalid(
+                "plasma.text_only must be true; Klipper D-Bus integration supports text only"
+                    .into(),
+            ));
+        }
+        if !self.plasma.desktop_to_slot && !self.plasma.slot_to_desktop {
+            return Err(ConfigError::Invalid(
+                "at least one of plasma.desktop_to_slot or plasma.slot_to_desktop must be true"
+                    .into(),
+            ));
+        }
+
+        let marked_slots: Vec<&str> = self
+            .slots
+            .iter()
+            .filter_map(|(name, configuration)| {
+                (configuration.plasma_mirror == Some(true)).then_some(name.as_str())
+            })
+            .collect();
+        if marked_slots.len() > 1 {
+            return Err(ConfigError::Invalid(
+                "only one slot can set plasma_mirror = true".into(),
+            ));
+        }
+        let mirror_slot = match (&self.plasma.mirror_slot, marked_slots.first()) {
+            (Some(configured), Some(marked)) if configured != marked => {
+                return Err(ConfigError::Invalid(format!(
+                    "plasma.mirror_slot ({configured}) conflicts with slots.{marked}.plasma_mirror"
+                )));
+            }
+            (Some(configured), _) => configured.clone(),
+            (None, Some(marked)) => (*marked).to_owned(),
+            (None, None) => {
+                return Err(ConfigError::Invalid(
+                    "plasma.mirror_slot is required when Plasma integration is enabled".into(),
+                ));
+            }
+        };
+
+        Ok(Some(ResolvedPlasmaConfig {
+            mirror_slot,
+            desktop_to_slot: self.plasma.desktop_to_slot,
+            slot_to_desktop: self.plasma.slot_to_desktop,
+        }))
     }
 
     pub fn slot_sync_enabled(&self, slot: &str) -> bool {
@@ -761,6 +816,78 @@ history_limit = 10
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn resolves_text_only_plasma_mirroring() {
+        let config: Config = toml::from_str(
+            r#"
+[plasma]
+enabled = true
+mirror_slot = "default"
+desktop_to_slot = true
+slot_to_desktop = true
+text_only = true
+
+[slots.default]
+plasma_mirror = true
+"#,
+        )
+        .unwrap();
+        let resolved = config
+            .resolve(
+                Some("/tmp/kclip.sock".into()),
+                Some("/tmp/data".into()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.plasma,
+            Some(ResolvedPlasmaConfig {
+                mirror_slot: "default".into(),
+                desktop_to_slot: true,
+                slot_to_desktop: true,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_non_text_plasma_configuration() {
+        for source in [
+            r#"
+[plasma]
+enabled = true
+mirror_slot = "default"
+slot_to_desktop = true
+text_only = false
+"#,
+            r#"
+[plasma]
+enabled = true
+mirror_slot = "default"
+slot_to_desktop = true
+text_only = true
+[slots.other]
+plasma_mirror = true
+"#,
+            r#"
+[plasma]
+enabled = true
+mirror_slot = "default"
+text_only = true
+"#,
+        ] {
+            let config: Config = toml::from_str(source).unwrap();
+            assert!(
+                config
+                    .resolve(
+                        Some("/tmp/kclip.sock".into()),
+                        Some("/tmp/data".into()),
+                        None,
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]
