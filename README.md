@@ -74,9 +74,9 @@ kclip paste [--slot NAME] [--file PATH]
 kclip list
 kclip clear [--slot NAME] [--local]
 kclip status
-kclip sync setup
+kclip sync setup [--recovery-file PATH]
 kclip sync status [--json]
-kclip sync recovery-code
+kclip sync recovery-code [--output PATH]
 kclip sync disconnect
 ```
 
@@ -141,9 +141,23 @@ kclip sync setup                   # on this client; setup code input is hidden
 Setup configures the relay and device label, asks whether this is the first
 device or an additional device, stores the private credential and account key,
 restarts `kclipd`, and does not report success until the daemon authenticates a
-live Noise connection. First-device setup displays 24 recovery words once;
-additional devices enter those same words through hidden input. Use
-`kclip sync status` for an actionable local-and-live checklist.
+live Noise connection. First-device setup displays 24 recovery words. The
+source client retains their underlying key, so they can be retrieved later or
+transferred to another client without placing them in command arguments:
+
+```bash
+# Source client: create a private mode-0600 recovery file.
+kclip sync recovery-code --output recovery-words.txt
+
+# Transfer the file securely, then use it while setting up the destination.
+kclip sync setup --recovery-file recovery-words.txt
+```
+
+Without these options, `sync recovery-code` requires an interactive warning
+and confirmation, while an additional device requests the words through hidden
+input. Recovery files contain the account secret in readable mnemonic form;
+delete or archive them securely after use. Use `kclip sync status` for an
+actionable local-and-live checklist.
 
 Setup reuses an existing account key only when the stored relay and account
 labels match the setup code. An unlabeled key or a real relay/account conflict
@@ -178,8 +192,9 @@ clipboard encryption across devices. `kclip sync disconnect` disables local
 sync and removes the device credential while retaining the account key. It also
 prints the pairing ID and the server-side revocation command; local disconnect
 alone cannot revoke the server copy. `kclip sync recovery-code` is the only
-command that prints recovery material and requires an interactive warning and
-confirmation.
+command that reveals recovery material. It requires an interactive warning and
+confirmation for terminal output, or an explicit `--output` path for a private
+file.
 
 ## Storage and durability
 

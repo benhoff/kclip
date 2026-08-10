@@ -140,7 +140,8 @@ How should this device get the shared encryption key?
 Choice [1-2]: 1
 
 Recovery words protect access to synchronized clipboard history.
-Store them somewhere private. They will be shown once during setup.
+Store them somewhere private. This client retains the key, so you can retrieve
+the words later with `kclip sync recovery-code`.
 
 <24 recovery words>
 
@@ -294,7 +295,8 @@ For the first device:
 
 For an additional device:
 
-1. Prompt for the existing 24 words through hidden input.
+1. Prompt for the existing 24 words through hidden input, or read them from an
+   explicitly supplied `--recovery-file` that passes private-file validation.
 2. Validate the mnemonic and derive the 32-byte key in memory.
 3. Never generate a fallback key after invalid input.
 4. Permit retry or cancellation without disk mutation.
@@ -419,9 +421,15 @@ nonzero exit status when setup is incomplete or unhealthy.
 
 This command replaces `kclip key export --show`.
 
-It MUST require an interactive terminal, warn that anyone with the words can
-decrypt synchronized history, request confirmation, and print the 24 words. It
-MUST never support ordinary JSON output or include the mnemonic in an error.
+With no options, it MUST require an interactive terminal, warn that anyone with
+the words can decrypt synchronized history, request confirmation, and print the
+24 words. With `--output PATH`, it MAY run noninteractively and MUST atomically
+write the mnemonic to a mode-`0600` file without also printing it. It MUST never
+support ordinary JSON output or include the mnemonic in an error.
+
+`kclip sync setup --recovery-file PATH` MUST import the mnemonic from a regular,
+owner-controlled mode-`0600` file instead of prompting for it. It MUST reject
+symlinks and group- or world-accessible files, and MUST NOT print the mnemonic.
 
 ### 9.2 `kclip sync disconnect`
 
