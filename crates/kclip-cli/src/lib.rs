@@ -3,7 +3,9 @@ use kclip_config::{
     Config, ConfigError, PreparedSyncConfig, SyncResolution, default_config_path,
     default_pairing_path, default_sync_key_path, prepare_sync_disconnect, prepare_sync_setup,
 };
-use kclip_crypto::{key_from_mnemonic, mnemonic_for_key, read_sync_key, write_sync_key};
+use kclip_crypto::{
+    key_from_mnemonic, mnemonic_for_key, read_sync_key, validate_secret_file, write_sync_key,
+};
 use kclip_protocol::{
     DEFAULT_SLOT, DaemonStatus, ErrorCode, FrameError, MAX_FRAME_SIZE, Operation, PROTOCOL_VERSION,
     ProtocolError, Request, Response, ResponsePayload, ResponseResult, RevisionMetadata,
@@ -102,11 +104,19 @@ pub enum Command {
 #[derive(Debug, Clone, Subcommand)]
 pub enum SyncCommand {
     /// Configure this device from one hidden server-generated setup code.
-    Setup,
+    Setup {
+        /// Load the shared account key from a private recovery-word file.
+        #[arg(long, value_name = "PATH")]
+        recovery_file: Option<PathBuf>,
+    },
     /// Show an actionable local and live synchronization checklist.
     Status,
-    /// Print the account recovery words after an interactive warning.
-    RecoveryCode,
+    /// Retrieve the account recovery words.
+    RecoveryCode {
+        /// Write the words to a mode-0600 file instead of showing them interactively.
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
     /// Disable synchronization and remove only this device's local credential.
     Disconnect,
 }
@@ -328,9 +338,21 @@ pub async fn execute_with_runtime(
             }
         }
         Command::Sync { command } => match command {
-            SyncCommand::Setup => execute_sync_setup(cli, input, output, secrets, runtime).await?,
+            SyncCommand::Setup { recovery_file } => {
+                execute_sync_setup(
+                    cli,
+                    input,
+                    output,
+                    secrets,
+                    runtime,
+                    recovery_file.as_deref(),
+                )
+                .await?
+            }
             SyncCommand::Status => execute_sync_status(cli, output).await?,
-            SyncCommand::RecoveryCode => execute_recovery_code(cli, input, output, secrets)?,
+            SyncCommand::RecoveryCode {
+                output: recovery_output,
+            } => execute_recovery_code(cli, input, output, secrets, recovery_output.as_deref())?,
             SyncCommand::Disconnect => execute_sync_disconnect(cli, output, runtime).await?,
         },
     }
@@ -350,6 +372,7 @@ async fn execute_sync_setup(
     output: &mut dyn Write,
     secrets: &mut dyn SecretInput,
     runtime: &mut dyn SetupRuntime,
+    recovery_file: Option<&Path>,
 ) -> Result<(), CliError> {
     if cli.json {
         return Err(CliError::Usage(
@@ -393,6 +416,11 @@ async fn execute_sync_setup(
         .unwrap_or_else(default_sync_key_path)?;
     let existing_pairing = read_optional_pairing(&pairing_path)?;
     let existing_key = read_optional_sync_key(&key_path)?;
+    if recovery_file.is_some() && existing_key.is_some() {
+        return Err(CliError::Usage(
+            "this client already has an account encryption key; omit --recovery-file".into(),
+        ));
+    }
     let relay_conflict = configured_relay.is_some_and(|value| value != setup.relay_url)
         && (config.sync.enabled || configured_account.is_some() || existing_key.is_some());
     let account_conflict = configured_account.is_some_and(|value| value != setup.username);
@@ -437,74 +465,83 @@ async fn execute_sync_setup(
 
     let mut new_key = None;
     if existing_key.is_none() {
-        writeln!(
-            output,
-            "The setup code authenticates this device. Recovery words provide the shared encryption key used by every device."
-        )?;
-        writeln!(output)?;
-        writeln!(
-            output,
-            "How should this device get the shared encryption key?"
-        )?;
-        writeln!(output, "  1) This is the first device for this account")?;
-        writeln!(output, "  2) Join devices that are already synchronized")?;
-        let choice = read_line_prompt(input, output, "Choice [1-2]: ", 16)?;
-        match choice.as_str() {
-            "1" => {
-                let mut key = [0_u8; 32];
-                getrandom::fill(&mut key)
-                    .map_err(|_| CliError::Usage("secure randomness is unavailable".into()))?;
-                let mnemonic = mnemonic_for_key(&key).map_err(SyncError::from)?;
-                writeln!(output)?;
-                writeln!(
-                    output,
-                    "Recovery words protect access to synchronized clipboard history. Every additional device needs them, and losing every copy loses access to that history."
-                )?;
-                writeln!(
-                    output,
-                    "Store them somewhere private. They will be shown once during setup."
-                )?;
-                writeln!(output)?;
-                writeln!(output, "{mnemonic}")?;
-                writeln!(output)?;
-                let saved = read_line_prompt(
-                    input,
-                    output,
-                    "Have you saved the recovery words? [y/N] ",
-                    16,
-                )?;
-                if !matches!(saved.to_ascii_lowercase().as_str(), "y" | "yes") {
-                    return Err(CliError::Usage(
+        if let Some(path) = recovery_file {
+            new_key = Some(read_recovery_key(path)?);
+            writeln!(
+                output,
+                "✓ Shared account encryption key loaded from {}",
+                path.display()
+            )?;
+        } else {
+            writeln!(
+                output,
+                "The setup code authenticates this device. Recovery words provide the shared encryption key used by every device."
+            )?;
+            writeln!(output)?;
+            writeln!(
+                output,
+                "How should this device get the shared encryption key?"
+            )?;
+            writeln!(output, "  1) This is the first device for this account")?;
+            writeln!(output, "  2) Join devices that are already synchronized")?;
+            let choice = read_line_prompt(input, output, "Choice [1-2]: ", 16)?;
+            match choice.as_str() {
+                "1" => {
+                    let mut key = [0_u8; 32];
+                    getrandom::fill(&mut key)
+                        .map_err(|_| CliError::Usage("secure randomness is unavailable".into()))?;
+                    let mnemonic = mnemonic_for_key(&key).map_err(SyncError::from)?;
+                    writeln!(output)?;
+                    writeln!(
+                        output,
+                        "Recovery words protect access to synchronized clipboard history. Every additional device needs them, and losing every copy loses access to that history."
+                    )?;
+                    writeln!(
+                        output,
+                        "Store them somewhere private. This client retains the key, so you can retrieve the words later with `kclip sync recovery-code`."
+                    )?;
+                    writeln!(output)?;
+                    writeln!(output, "{mnemonic}")?;
+                    writeln!(output)?;
+                    let saved = read_line_prompt(
+                        input,
+                        output,
+                        "Have you saved the recovery words? [y/N] ",
+                        16,
+                    )?;
+                    if !matches!(saved.to_ascii_lowercase().as_str(), "y" | "yes") {
+                        return Err(CliError::Usage(
                         "setup cancelled before recovery words were confirmed; no files were changed"
                             .into(),
                     ));
+                    }
+                    new_key = Some(key);
                 }
-                new_key = Some(key);
-            }
-            "2" => loop {
-                let words = secrets.read_hidden("Existing 24-word recovery mnemonic: ")?;
-                if words.trim().is_empty() {
+                "2" => loop {
+                    let words = secrets.read_hidden("Existing 24-word recovery mnemonic: ")?;
+                    if words.trim().is_empty() {
+                        return Err(CliError::Usage(
+                            "setup cancelled; no files were changed".into(),
+                        ));
+                    }
+                    match key_from_mnemonic(words.trim()) {
+                        Ok(key) => {
+                            new_key = Some(key);
+                            break;
+                        }
+                        Err(_) => {
+                            writeln!(
+                                output,
+                                "The recovery words are invalid. Try again, or submit an empty value to cancel."
+                            )?;
+                        }
+                    }
+                },
+                _ => {
                     return Err(CliError::Usage(
-                        "setup cancelled; no files were changed".into(),
+                        "setup cancelled: choose 1 or 2; no files were changed".into(),
                     ));
                 }
-                match key_from_mnemonic(words.trim()) {
-                    Ok(key) => {
-                        new_key = Some(key);
-                        break;
-                    }
-                    Err(_) => {
-                        writeln!(
-                            output,
-                            "The recovery words are invalid. Try again, or submit an empty value to cancel."
-                        )?;
-                    }
-                }
-            },
-            _ => {
-                return Err(CliError::Usage(
-                    "setup cancelled: choose 1 or 2; no files were changed".into(),
-                ));
             }
         }
     }
@@ -723,15 +760,16 @@ fn execute_recovery_code(
     input: &mut dyn Read,
     output: &mut dyn Write,
     secrets: &mut dyn SecretInput,
+    recovery_output: Option<&Path>,
 ) -> Result<(), CliError> {
     if cli.json {
         return Err(CliError::Usage(
             "sync recovery-code never supports --json".into(),
         ));
     }
-    if !secrets.is_interactive() {
+    if recovery_output.is_none() && !secrets.is_interactive() {
         return Err(CliError::Usage(
-            "sync recovery-code requires an interactive terminal".into(),
+            "sync recovery-code requires an interactive terminal unless --output is used".into(),
         ));
     }
     let config_path = default_config_path()?;
@@ -743,6 +781,18 @@ fn execute_recovery_code(
         .map(Ok)
         .unwrap_or_else(default_sync_key_path)?;
     let key = read_sync_key(&key_path).map_err(SyncError::from)?;
+    let mnemonic = mnemonic_for_key(&key).map_err(SyncError::from)?;
+    if let Some(path) = recovery_output {
+        let mut contents = mnemonic.into_bytes();
+        contents.push(b'\n');
+        atomic_write(path, &contents)?;
+        writeln!(
+            output,
+            "Recovery words written to {} (mode 0600).",
+            path.display()
+        )?;
+        return Ok(());
+    }
     writeln!(
         output,
         "WARNING: anyone with these recovery words can decrypt synchronized clipboard history."
@@ -751,9 +801,24 @@ fn execute_recovery_code(
     if !matches!(confirmed.to_ascii_lowercase().as_str(), "y" | "yes") {
         return Err(CliError::Usage("recovery-code cancelled".into()));
     }
-    let mnemonic = mnemonic_for_key(&key).map_err(SyncError::from)?;
     writeln!(output, "{mnemonic}")?;
     Ok(())
+}
+
+fn read_recovery_key(path: &Path) -> Result<[u8; 32], CliError> {
+    validate_secret_file(path).map_err(SyncError::from)?;
+    let file = File::open(path)?;
+    let mut contents = String::new();
+    file.take(4097).read_to_string(&mut contents)?;
+    if contents.len() > 4096 {
+        return Err(CliError::Usage(format!(
+            "recovery file {} is too large",
+            path.display()
+        )));
+    }
+    key_from_mnemonic(contents.trim())
+        .map_err(SyncError::from)
+        .map_err(Into::into)
 }
 
 async fn execute_sync_disconnect(
@@ -1387,6 +1452,8 @@ mod tests {
         values: VecDeque<String>,
     }
 
+    struct NonInteractiveSecrets;
+
     struct MockRuntime {
         restart: RestartOutcome,
         statuses: VecDeque<Option<DaemonStatus>>,
@@ -1402,6 +1469,16 @@ mod tests {
             self.values
                 .pop_front()
                 .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+        }
+    }
+
+    impl SecretInput for NonInteractiveSecrets {
+        fn is_interactive(&self) -> bool {
+            false
+        }
+
+        fn read_hidden(&mut self, _prompt: &str) -> io::Result<String> {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
         }
     }
 
@@ -1553,7 +1630,122 @@ mod tests {
             assert!(Cli::try_parse_from(["kclip", command]).is_err());
         }
         assert!(Cli::try_parse_from(["kclip", "sync", "setup"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kclip", "sync", "setup", "--recovery-file", "recovery.txt"])
+                .is_ok()
+        );
         assert!(Cli::try_parse_from(["kclip", "sync", "status"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kclip", "sync", "recovery-code", "--output", "recovery.txt"])
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_file_transfers_key_between_client_instances() {
+        let _environment = ENVIRONMENT.lock().await;
+        let temp = TempDir::new().unwrap();
+        let source_config = temp.path().join("source-config");
+        let source_data = temp.path().join("source-data");
+        let destination_config = temp.path().join("destination-config");
+        let destination_data = temp.path().join("destination-data");
+        let recovery_file = temp.path().join("recovery-words.txt");
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+        let old_data = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &source_config);
+            std::env::set_var("XDG_DATA_HOME", &source_data);
+        }
+
+        let expected_key = [5_u8; 32];
+        write_sync_key(&default_sync_key_path().unwrap(), &expected_key).unwrap();
+        let mnemonic = mnemonic_for_key(&expected_key).unwrap();
+        let export_cli = Cli {
+            socket: Some(temp.path().join("unused-source.sock")),
+            json: false,
+            command: Command::Sync {
+                command: SyncCommand::RecoveryCode {
+                    output: Some(recovery_file.clone()),
+                },
+            },
+        };
+        let mut export_input = Cursor::new(Vec::new());
+        let mut export_output = Vec::new();
+        execute_with_secret_input(
+            &export_cli,
+            &mut export_input,
+            &mut export_output,
+            &mut NonInteractiveSecrets,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::metadata(&recovery_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&recovery_file).unwrap().trim(), mnemonic);
+        assert!(
+            !String::from_utf8(export_output)
+                .unwrap()
+                .contains(&mnemonic)
+        );
+
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &destination_config);
+            std::env::set_var("XDG_DATA_HOME", &destination_data);
+        }
+        let setup_cli = Cli {
+            socket: Some(temp.path().join("mock-destination.sock")),
+            json: false,
+            command: Command::Sync {
+                command: SyncCommand::Setup {
+                    recovery_file: Some(recovery_file.clone()),
+                },
+            },
+        };
+        let fixture = include_str!("../../../fixtures/kclip-setup-v1.txt")
+            .trim()
+            .to_owned();
+        let mut secrets = MockSecrets {
+            values: VecDeque::from([fixture]),
+        };
+        let mut ready = daemon_status(None);
+        ready.synchronization_state = "connected".into();
+        ready.authenticated = true;
+        let mut runtime = MockRuntime {
+            restart: RestartOutcome::Restarted,
+            statuses: VecDeque::from([Some(ready)]),
+            delays: 0,
+        };
+        let mut setup_input = Cursor::new(Vec::new());
+        let mut setup_output = Vec::new();
+        execute_with_runtime(
+            &setup_cli,
+            &mut setup_input,
+            &mut setup_output,
+            &mut secrets,
+            &mut runtime,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_sync_key(&destination_data.join("kclip/sync.key")).unwrap(),
+            expected_key
+        );
+        assert!(!String::from_utf8(setup_output).unwrap().contains(&mnemonic));
+
+        unsafe {
+            match old_config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match old_data {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
     }
 
     #[test]
@@ -1584,7 +1776,9 @@ mod tests {
             socket: Some(temp.path().join("unused.sock")),
             json: false,
             command: Command::Sync {
-                command: SyncCommand::Setup,
+                command: SyncCommand::Setup {
+                    recovery_file: None,
+                },
             },
         };
         let fixture = include_str!("../../../fixtures/kclip-setup-v1.txt")
@@ -1648,7 +1842,9 @@ mod tests {
             socket: Some(temp.path().join("mock.sock")),
             json: false,
             command: Command::Sync {
-                command: SyncCommand::Setup,
+                command: SyncCommand::Setup {
+                    recovery_file: None,
+                },
             },
         };
         let fixture = include_str!("../../../fixtures/kclip-setup-v1.txt")
@@ -1714,7 +1910,9 @@ mod tests {
             socket: Some(temp.path().join("mock.sock")),
             json: false,
             command: Command::Sync {
-                command: SyncCommand::Setup,
+                command: SyncCommand::Setup {
+                    recovery_file: None,
+                },
             },
         };
         let fixture = include_str!("../../../fixtures/kclip-setup-v1.txt")

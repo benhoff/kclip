@@ -144,9 +144,9 @@ aliases are rejected rather than ignored or migrated.
 The Rust `kclip` CLI provides these synchronization commands:
 
 ```text
-kclip sync setup
+kclip sync setup [--recovery-file PATH]
 kclip sync status
-kclip sync recovery-code
+kclip sync recovery-code [--output PATH]
 kclip sync disconnect
 ```
 
@@ -154,10 +154,10 @@ kclip sync disconnect
 input and strictly validate its version, relay URL, account and device labels,
 canonical pairing ID, and 32-byte base64url secret. It then guides the user to
 either generate the first account synchronization key or join an existing
-account by entering its 24 recovery words through hidden input. Configuration,
-the pairing credential, and any newly supplied key MUST be committed as one
-recoverable setup operation. Secret files use mode `0600` inside mode `0700`
-directories.
+account by entering its 24 recovery words through hidden input or supplying a
+private recovery file. Configuration, the pairing credential, and any newly
+supplied key MUST be committed as one recoverable setup operation. Secret files
+use mode `0600` inside mode `0700` directories.
 
 Version 1 uses one 32-byte account synchronization key shared by the user's
 devices. Generating an unrelated key would isolate that device from existing
@@ -165,10 +165,13 @@ ciphertext, so setup MUST clearly distinguish the first device from a device
 joining an existing account. It MUST NOT discover or import Python-client files
 automatically.
 
-`kclip sync recovery-code` reveals the current account recovery words only
-after an interactive warning and confirmation. `kclip sync disconnect` disables
-sync and removes the local pairing credential while retaining the account key;
-it MUST explain that server-side revocation is a separate administrator action.
+`kclip sync recovery-code` reveals the current account recovery words after an
+interactive warning and confirmation, or writes them to an explicitly requested
+mode-`0600` file. `kclip sync setup --recovery-file PATH` lets another client
+import that private file without exposing the words in process arguments.
+`kclip sync disconnect` disables sync and removes the local pairing credential
+while retaining the account key; it MUST explain that server-side revocation is
+a separate administrator action.
 
 Recovery escrow and account-key rotation require a later specification.
 
