@@ -307,7 +307,7 @@ async fn worker_loop(
                 let category = error.category().to_owned();
                 let credential =
                     matches!(error, SyncError::Credentials(_) | SyncError::Authentication);
-                warn!(category, "synchronization attempt failed");
+                warn!(category, error = %error, "synchronization attempt failed");
                 set_state(&status, "disconnected", false, credential, Some(category)).await;
                 let wait = jittered(delay, configuration.reconnect_max_delay);
                 delay = delay

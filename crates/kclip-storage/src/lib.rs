@@ -1,5 +1,5 @@
 use kclip_protocol::{RevisionMetadata, validate_slot_name};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -15,7 +15,44 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaCompatibility {
+    Current,
+    Migratable,
+    Unsupported,
+}
+
+pub fn schema_compatibility(version: u32) -> SchemaCompatibility {
+    match version {
+        SCHEMA_VERSION => SchemaCompatibility::Current,
+        0 | 4 => SchemaCompatibility::Migratable,
+        _ => SchemaCompatibility::Unsupported,
+    }
+}
+
+pub fn inspect_schema_version(
+    database_path: impl AsRef<Path>,
+) -> Result<Option<u32>, StorageError> {
+    let database_path = database_path.as_ref();
+    match fs::metadata(database_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map(Some)
+        .map_err(StorageError::from)
+}
+
+pub fn migrate_database_schema(database_path: impl AsRef<Path>) -> Result<u32, StorageError> {
+    let connection = open_database_connection(database_path.as_ref())?;
+    drop(connection);
+    Ok(SCHEMA_VERSION)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationOptions {
@@ -99,20 +136,7 @@ impl Storage {
         max_content_size: u64,
     ) -> Result<Self, StorageError> {
         let database_path = database_path.as_ref();
-        let database_parent = database_path.parent().ok_or_else(|| {
-            StorageError::InvalidPath("database path has no parent directory".into())
-        })?;
-        create_private_directory(database_parent)?;
-
-        let mut connection = Connection::open(database_path)?;
-        fs::set_permissions(database_path, fs::Permissions::from_mode(0o600))?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;
-             PRAGMA synchronous = FULL;",
-        )?;
-        apply_migrations(&mut connection)?;
+        let connection = open_database_connection(database_path)?;
 
         let blobs = BlobStore::open(blob_directory)?;
         blobs.recover_temporary_files()?;
@@ -985,15 +1009,33 @@ fn revision_from_row_offset(
     })
 }
 
+fn open_database_connection(database_path: &Path) -> Result<Connection, StorageError> {
+    let database_parent = database_path
+        .parent()
+        .ok_or_else(|| StorageError::InvalidPath("database path has no parent directory".into()))?;
+    create_private_directory(database_parent)?;
+
+    let mut connection = Connection::open(database_path)?;
+    fs::set_permissions(database_path, fs::Permissions::from_mode(0o600))?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA synchronous = FULL;",
+    )?;
+    apply_migrations(&mut connection)?;
+    Ok(connection)
+}
+
 fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
     let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current != 0 && current != SCHEMA_VERSION {
-        return Err(StorageError::UnsupportedSchema(current));
-    }
-    if current == 0 {
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(
-            "CREATE TABLE local_state (
+    match schema_compatibility(current) {
+        SchemaCompatibility::Current => Ok(()),
+        SchemaCompatibility::Unsupported => Err(StorageError::UnsupportedSchema(current)),
+        SchemaCompatibility::Migratable if current == 0 => {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE local_state (
                  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                  device_id TEXT NOT NULL,
                  next_origin_sequence INTEGER NOT NULL CHECK(next_origin_sequence >= 1),
@@ -1027,7 +1069,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
                  is_deleted INTEGER NOT NULL CHECK(is_deleted IN (0, 1)),
                  is_local_only INTEGER NOT NULL CHECK(is_local_only IN (0, 1)),
                  source_adapter TEXT NOT NULL,
-                 parent_revision_id TEXT REFERENCES revisions(revision_id),
+                 parent_revision_id TEXT,
                  UNIQUE(origin_device_id, origin_sequence)
              );
 
@@ -1059,18 +1101,95 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
                  error_category TEXT NOT NULL,
                  quarantined_at INTEGER NOT NULL
              );",
-        )?;
-        transaction.execute(
-            "INSERT INTO local_state (
+            )?;
+            transaction.execute(
+                "INSERT INTO local_state (
                  singleton, device_id, next_origin_sequence, last_hlc_physical,
                  last_hlc_logical, sync_server_cursor, last_retention_floor,
                  last_retention_at, retention_truncation_count,
                  last_acknowledged_at
              ) VALUES (1, ?1, 1, 0, 0, 0, NULL, NULL, 0, NULL)",
-            [format!("device-{}", Uuid::new_v4().simple())],
+                [format!("device-{}", Uuid::new_v4().simple())],
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        SchemaCompatibility::Migratable if current == 4 => migrate_v4_to_v5(connection),
+        SchemaCompatibility::Migratable => unreachable!("all migratable schemas are handled"),
+    }
+}
+
+fn migrate_v4_to_v5(connection: &mut Connection) -> Result<(), StorageError> {
+    ensure_foreign_keys_valid(connection)?;
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let migration: Result<(), StorageError> = (|| {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE revisions_v5 (
+                 revision_id TEXT PRIMARY KEY,
+                 slot_name TEXT NOT NULL REFERENCES slots(slot_name),
+                 origin_device_id TEXT NOT NULL,
+                 origin_sequence INTEGER NOT NULL,
+                 hlc_physical INTEGER NOT NULL,
+                 hlc_logical INTEGER NOT NULL,
+                 content_hash TEXT,
+                 content_size INTEGER NOT NULL,
+                 content_type TEXT,
+                 created_at INTEGER NOT NULL,
+                 expires_at INTEGER,
+                 is_deleted INTEGER NOT NULL CHECK(is_deleted IN (0, 1)),
+                 is_local_only INTEGER NOT NULL CHECK(is_local_only IN (0, 1)),
+                 source_adapter TEXT NOT NULL,
+                 parent_revision_id TEXT,
+                 UNIQUE(origin_device_id, origin_sequence)
+             );
+
+             INSERT INTO revisions_v5 (
+                 revision_id, slot_name, origin_device_id, origin_sequence,
+                 hlc_physical, hlc_logical, content_hash, content_size,
+                 content_type, created_at, expires_at, is_deleted,
+                 is_local_only, source_adapter, parent_revision_id
+             )
+             SELECT revision_id, slot_name, origin_device_id, origin_sequence,
+                    hlc_physical, hlc_logical, content_hash, content_size,
+                    content_type, created_at, expires_at, is_deleted,
+                    is_local_only, source_adapter, parent_revision_id
+             FROM revisions;
+
+             DROP TABLE revisions;
+             ALTER TABLE revisions_v5 RENAME TO revisions;
+             CREATE INDEX revisions_content_hash
+                 ON revisions(content_hash) WHERE content_hash IS NOT NULL;",
         )?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
+        Ok(())
+    })();
+    let foreign_keys = connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(StorageError::from);
+    migration?;
+    foreign_keys?;
+    ensure_foreign_keys_valid(connection)
+}
+
+fn ensure_foreign_keys_valid(connection: &Connection) -> Result<(), StorageError> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    let violation = statement
+        .query_row([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .optional()?;
+    if let Some((table, row_id, parent, constraint)) = violation {
+        return Err(StorageError::Corrupt(format!(
+            "foreign key violation in {table} row {row_id} referencing {parent} constraint {constraint}"
+        )));
     }
     Ok(())
 }
@@ -1372,6 +1491,106 @@ mod tests {
     }
 
     #[test]
+    fn schema_inspection_is_read_only_and_reports_upgrade_compatibility() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("inspect.db");
+        assert_eq!(inspect_schema_version(&database_path).unwrap(), None);
+        assert!(!database_path.exists());
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .pragma_update(None, "user_version", 4_u32)
+            .unwrap();
+        drop(connection);
+        assert_eq!(inspect_schema_version(&database_path).unwrap(), Some(4));
+        assert_eq!(schema_compatibility(4), SchemaCompatibility::Migratable);
+        assert_eq!(
+            schema_compatibility(SCHEMA_VERSION),
+            SchemaCompatibility::Current
+        );
+        assert_eq!(schema_compatibility(3), SchemaCompatibility::Unsupported);
+    }
+
+    #[test]
+    fn schema_v4_is_migrated_without_losing_parent_metadata() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("kclip.db");
+        let (parent_id, child_id) = {
+            let storage = storage(&temp);
+            let parent = storage.copy("default", b"parent", None).unwrap();
+            let child = storage
+                .copy_with_options("default", b"child", None, sync_mutation_options())
+                .unwrap();
+            storage
+                .record_inbox(&inbox("pending-event", 1, "remote"))
+                .unwrap();
+            (parent.revision_id, child.revision_id)
+        };
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE revisions_v4 (
+                     revision_id TEXT PRIMARY KEY,
+                     slot_name TEXT NOT NULL REFERENCES slots(slot_name),
+                     origin_device_id TEXT NOT NULL,
+                     origin_sequence INTEGER NOT NULL,
+                     hlc_physical INTEGER NOT NULL,
+                     hlc_logical INTEGER NOT NULL,
+                     content_hash TEXT,
+                     content_size INTEGER NOT NULL,
+                     content_type TEXT,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER,
+                     is_deleted INTEGER NOT NULL CHECK(is_deleted IN (0, 1)),
+                     is_local_only INTEGER NOT NULL CHECK(is_local_only IN (0, 1)),
+                     source_adapter TEXT NOT NULL,
+                     parent_revision_id TEXT REFERENCES revisions_v4(revision_id),
+                     UNIQUE(origin_device_id, origin_sequence)
+                 );
+                 INSERT INTO revisions_v4 SELECT * FROM revisions;
+                 DROP TABLE revisions;
+                 ALTER TABLE revisions_v4 RENAME TO revisions;
+                 CREATE INDEX revisions_content_hash
+                     ON revisions(content_hash) WHERE content_hash IS NOT NULL;
+                 PRAGMA user_version = 4;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            migrate_database_schema(&database_path).unwrap(),
+            SCHEMA_VERSION
+        );
+        let storage = storage(&temp);
+        assert_eq!(storage.pending_outbox(10).unwrap().len(), 1);
+        assert_eq!(storage.pending_inbox().unwrap().len(), 1);
+        let connection = storage.lock_connection().unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let stored_parent: Option<String> = connection
+            .query_row(
+                "SELECT parent_revision_id FROM revisions WHERE revision_id = ?1",
+                [child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_parent.as_deref(), Some(parent_id.as_str()));
+        let foreign_key_columns: Vec<String> = connection
+            .prepare("PRAGMA foreign_key_list(revisions)")
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(foreign_key_columns, ["slot_name"]);
+    }
+
+    #[test]
     fn pre_clean_break_databases_are_rejected() {
         for version in [1_u32, 2, 3] {
             let mut connection = Connection::open_in_memory().unwrap();
@@ -1532,6 +1751,55 @@ mod tests {
     }
 
     #[test]
+    fn first_synced_revision_may_reference_a_pre_sync_parent() {
+        let source_temp = TempDir::new().unwrap();
+        let destination_temp = TempDir::new().unwrap();
+        let source = storage(&source_temp);
+        let destination = storage(&destination_temp);
+        let parent = source.copy("default", b"before setup", None).unwrap();
+        source
+            .copy_with_options("default", b"after setup", None, sync_mutation_options())
+            .unwrap();
+
+        let received = apply_pending_revision(&source, &destination, 1);
+        assert_eq!(
+            received.parent_revision_id.as_deref(),
+            Some(parent.revision_id.as_str())
+        );
+        assert_eq!(destination.paste("default").unwrap().1, b"after setup");
+    }
+
+    #[test]
+    fn synced_revision_may_reference_a_local_only_parent() {
+        let source_temp = TempDir::new().unwrap();
+        let destination_temp = TempDir::new().unwrap();
+        let source = storage(&source_temp);
+        let destination = storage(&destination_temp);
+        let parent = source
+            .copy_with_options(
+                "default",
+                b"private parent",
+                None,
+                MutationOptions {
+                    source_adapter: "cli".into(),
+                    local_only: true,
+                    enqueue_sync: true,
+                },
+            )
+            .unwrap();
+        source
+            .copy_with_options("default", b"shared child", None, sync_mutation_options())
+            .unwrap();
+
+        let received = apply_pending_revision(&source, &destination, 1);
+        assert_eq!(
+            received.parent_revision_id.as_deref(),
+            Some(parent.revision_id.as_str())
+        );
+        assert_eq!(destination.paste("default").unwrap().1, b"shared child");
+    }
+
+    #[test]
     fn acknowledgement_deletes_the_transient_outbox_row() {
         let temp = TempDir::new().unwrap();
         let storage = storage(&temp);
@@ -1595,6 +1863,38 @@ mod tests {
             tag: "tag".into(),
             accepted_at: 1,
         }
+    }
+
+    fn sync_mutation_options() -> MutationOptions {
+        MutationOptions {
+            source_adapter: "cli".into(),
+            local_only: false,
+            enqueue_sync: true,
+        }
+    }
+
+    fn apply_pending_revision(
+        source: &Storage,
+        destination: &Storage,
+        server_sequence: u64,
+    ) -> StoredRevision {
+        let pending = source.pending_outbox(1).unwrap().remove(0);
+        destination
+            .record_inbox(&inbox(
+                &pending.message_id,
+                server_sequence,
+                &pending.revision.metadata.origin_device_id,
+            ))
+            .unwrap();
+        destination
+            .apply_remote_revision(
+                &pending.message_id,
+                pending.revision.metadata.clone(),
+                pending.revision.parent_revision_id.as_deref(),
+                pending.revision.content.as_deref(),
+            )
+            .unwrap();
+        pending.revision
     }
 
     #[test]
@@ -1693,6 +1993,30 @@ mod tests {
         assert_eq!(status.server_cursor, 49);
         assert_eq!(status.last_retention_floor, Some(50));
         assert_eq!(status.retention_truncation_count, 1);
+    }
+
+    #[test]
+    fn retained_suffix_may_reference_an_expired_parent() {
+        let temp = TempDir::new().unwrap();
+        let storage = storage(&temp);
+        assert_eq!(
+            storage.accept_retention_floor(10, 10).unwrap(),
+            RetentionFloorOutcome::Advanced(9)
+        );
+        storage
+            .record_inbox(&inbox("retained-child", 10, "remote"))
+            .unwrap();
+        storage
+            .apply_remote_revision(
+                "retained-child",
+                remote_metadata("remote", 10, 10, b"retained"),
+                Some("remote:9"),
+                Some(b"retained"),
+            )
+            .unwrap();
+
+        assert_eq!(storage.sync_status().unwrap().server_cursor, 10);
+        assert_eq!(storage.paste("default").unwrap().1, b"retained");
     }
 
     #[test]

@@ -1,6 +1,10 @@
 use clap::Parser;
 use kclip_config::{Config, ConfigUpdate, default_config_path, update_config_file};
 use kclip_daemon::{ServerConfig, run_until};
+use kclip_storage::{
+    SCHEMA_VERSION, SchemaCompatibility, inspect_schema_version, migrate_database_schema,
+    schema_compatibility,
+};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -29,6 +33,28 @@ struct Arguments {
         conflicts_with_all = ["socket", "data_dir", "max_content_size"]
     )]
     update_config: bool,
+
+    /// Print machine-readable storage compatibility details for install.sh.
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = ["socket", "data_dir", "max_content_size", "update_config"]
+    )]
+    installer_storage_info: bool,
+
+    /// Migrate storage for install.sh without starting the daemon.
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = [
+            "socket",
+            "data_dir",
+            "max_content_size",
+            "update_config",
+            "installer_storage_info"
+        ]
+    )]
+    installer_migrate_storage: bool,
 }
 
 #[tokio::main]
@@ -45,6 +71,38 @@ async fn main() {
 
     let arguments = Arguments::parse();
     let result = async {
+        if arguments.installer_storage_info {
+            let config = Config::load(arguments.config.as_deref())?;
+            let resolved =
+                config.resolve(Some(PathBuf::from("/run/kclip-installer.sock")), None, None)?;
+            let existing = inspect_schema_version(&resolved.database_path)?;
+            match existing {
+                None => println!("absent - {SCHEMA_VERSION}"),
+                Some(version) => {
+                    let state = match schema_compatibility(version) {
+                        SchemaCompatibility::Current => "current",
+                        SchemaCompatibility::Migratable => "migratable",
+                        SchemaCompatibility::Unsupported => "unsupported",
+                    };
+                    println!("{state} {version} {SCHEMA_VERSION}");
+                }
+            }
+            println!("{}", resolved.database_path.display());
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
+
+        if arguments.installer_migrate_storage {
+            let config = Config::load(arguments.config.as_deref())?;
+            let resolved =
+                config.resolve(Some(PathBuf::from("/run/kclip-installer.sock")), None, None)?;
+            let version = migrate_database_schema(&resolved.database_path)?;
+            println!(
+                "Migrated database to schema {version}: {}",
+                resolved.database_path.display()
+            );
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
+
         if arguments.update_config {
             let path = match arguments.config.clone() {
                 Some(path) => path,

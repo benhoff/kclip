@@ -57,7 +57,17 @@ Useful non-interactive overrides:
 ./install.sh --user             # use ~/.local/bin without sudo
 ./install.sh --prefix /opt/kclip # use a custom installation prefix
 ./install.sh --no-start         # install without starting the service
+./install.sh --database-action migrate # approve a supported DB migration non-interactively
 ```
+
+When an existing database uses an older schema, an interactive install asks
+whether to migrate, delete, or abort before replacing and restarting the
+daemon. A selected migration runs and is verified during installation; it is
+offered only when the release has an explicit migration. Otherwise the choices
+are deletion or abort. Automated installs must select
+`--database-action migrate`, `delete`, or `abort` when a schema decision is
+required. Deletion removes the database and SQLite sidecars without creating a
+backup, but retains synchronization credentials and the account key.
 
 If `sudo` is unavailable, the default installation automatically falls back to
 `~/.local`. If the selected binary directory is not already on `PATH`, the
@@ -194,9 +204,9 @@ Defaults follow the XDG base-directory specification:
 - Noise pairing credential: `$XDG_CONFIG_HOME/kclip/pairing.json`
 - Account sync key: `$XDG_DATA_HOME/kclip/sync.key`
 
-This clean-break release uses client database schema version 4 and does not
-upgrade versions 1 through 3. Archive or remove the old database and blob
-directory before starting the new daemon.
+This release uses client database schema version 5 and automatically upgrades
+schema version 4. Versions 1 through 3 remain unsupported; archive or remove
+those old databases and blob directories before starting the new daemon.
 
 Existing configuration files must also drop the retired history settings,
 `[security]`, `plasma.text_only`, and per-slot `plasma_mirror`; place

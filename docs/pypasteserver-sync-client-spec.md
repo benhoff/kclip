@@ -338,6 +338,12 @@ RevisionV1 {
 }
 ```
 
+`parent_revision_id` is an immutable weak causal reference. Its referenced
+revision MAY be absent locally because synchronization began after the parent
+was created, the parent is local-only, or relay retention removed it. Clients
+MUST preserve the identifier but MUST NOT require the parent revision to exist,
+backfill ancestors, or block application of an otherwise valid revision.
+
 Canonical CBOR means deterministic map-key ordering, shortest integer encoding,
 definite lengths, and byte strings for `content`. The committed cross-repository
 fixture is authoritative if a library's default differs.
@@ -421,11 +427,12 @@ cursor plus one. A later gap without a preceding validated `ready` or
 
 ## 12. Storage responsibilities
 
-This clean-break release establishes client storage schema version 4. Versions
-1 through 3 are unsupported: the client MUST fail without modifying, replacing,
-or importing such a database. An operator may archive or remove the old
-database and blob directory before starting this release. Schema changes after
-this baseline require explicit migrations.
+This release establishes client storage schema version 5. Schema version 4 is
+upgraded explicitly by rebuilding the `revisions` table without a foreign-key
+constraint on `parent_revision_id`; all revision metadata and queue state are
+preserved. Versions 1 through 3 are unsupported: the client MUST fail without
+modifying, replacing, or importing such a database. An operator may archive or
+remove those old database and blob directories before starting this release.
 
 The baseline contains only a singleton typed `local_state` row, `slots`,
 `revisions`, pending-only `outbox` and `inbox` queues, and
@@ -572,8 +579,9 @@ command may be added later without changing normal clipboard commands.
 
 On startup, `kclipd` should:
 
-1. Open schema-version-4 storage or create a fresh database; reject every other
-   existing schema version without modifying it.
+1. Open schema-version-5 storage, explicitly migrate schema version 4, or
+   create a fresh database; reject every other existing schema version without
+   modifying it.
 2. Start local IPC immediately.
 3. Recover temporary blobs and incomplete inbox/outbox state.
 4. Start adapters and the sync worker if enabled and validly configured.

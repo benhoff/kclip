@@ -7,10 +7,12 @@ PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PREFIX=${KCLIP_PREFIX:-/usr/local}
 PREFIX_EXPLICIT=0
 START_SERVICE=1
+DATABASE_ACTION=prompt
 MINIMUM_RUST_VERSION=1.88.0
 SUDO_READY=0
 ADMIN=()
 TEMP_SERVICE=""
+SERVICE_STOPPED_FOR_DATABASE=0
 
 info() {
     printf '==> %s\n' "$*"
@@ -80,6 +82,9 @@ Options:
   --prefix PATH  Install binaries below PATH (default: /usr/local)
   --user         Install binaries below $HOME/.local without sudo
   --no-start     Install and configure without starting the user service
+  --database-action ACTION
+                 On a schema change: prompt, migrate, delete, or abort
+                 (default: prompt)
   -h, --help     Show this help
 
 Environment:
@@ -111,6 +116,15 @@ while (($# > 0)); do
         --no-start)
             START_SERVICE=0
             shift
+            ;;
+        --database-action)
+            (($# >= 2)) || fail "--database-action requires an action"
+            DATABASE_ACTION=$2
+            case "$DATABASE_ACTION" in
+                prompt|migrate|delete|abort) ;;
+                *) fail "--database-action must be prompt, migrate, delete, or abort" ;;
+            esac
+            shift 2
             ;;
         -h|--help)
             usage
@@ -240,6 +254,102 @@ CONFIG_FILE="$CONFIG_ROOT/kclip/config.toml"
 SYSTEMD_USER_DIR="$CONFIG_ROOT/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/kclipd.service"
 
+stop_service_for_database_change() {
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user is-active --quiet kclipd.service; then
+        info "Stopping kclipd before changing its database"
+        systemctl --user stop kclipd.service \
+            || fail "could not stop kclipd.service; the database was not changed"
+        SERVICE_STOPPED_FOR_DATABASE=1
+    fi
+    if command -v pgrep >/dev/null 2>&1 && pgrep -u "$EUID" -x kclipd >/dev/null; then
+        fail "another kclipd process is still running; stop it before changing the database"
+    fi
+}
+
+delete_existing_database() {
+    local database_path=$1
+    [[ "$database_path" == /* ]] || fail "refusing to delete a non-absolute database path: ${database_path}"
+    [[ "$database_path" != / ]] || fail "refusing to delete the filesystem root"
+
+    stop_service_for_database_change
+
+    rm -f -- "$database_path" "${database_path}-wal" "${database_path}-shm"
+    info "Deleted database and SQLite sidecars: ${database_path}"
+    info "This deletion has no installer-created backup; unreferenced blobs are cleaned on the next daemon start"
+}
+
+handle_database_upgrade() {
+    local output database_state existing_schema target_schema database_path selected answer
+    local -a storage_lines
+    output=$("$DAEMON_SOURCE" --config "$CONFIG_FILE" --installer-storage-info) \
+        || fail "could not inspect the existing kclip database"
+    mapfile -t storage_lines <<<"$output"
+    ((${#storage_lines[@]} >= 2)) || fail "kclipd returned incomplete storage information"
+    read -r database_state existing_schema target_schema <<<"${storage_lines[0]}"
+    database_path=${storage_lines[1]}
+
+    case "$database_state" in
+        absent|current)
+            return
+            ;;
+        migratable|unsupported) ;;
+        *) fail "kclipd returned an unknown database state: ${database_state}" ;;
+    esac
+
+    selected=$DATABASE_ACTION
+    if [[ "$selected" == prompt ]]; then
+        [[ -t 0 ]] || fail \
+            "database schema ${existing_schema} requires a decision; rerun with --database-action migrate, delete, or abort"
+        printf '\nExisting kclip database: %s\n' "$database_path"
+        printf 'Database schema: %s; this release uses schema %s.\n' "$existing_schema" "$target_schema"
+        if [[ "$database_state" == migratable ]]; then
+            printf 'Migration preserves local history and pending synchronization state.\n'
+            printf 'Deletion permanently discards the local database; credentials and the account key are retained.\n'
+            while true; do
+                read -r -p 'Choose [m]igrate, [d]elete, or [a]bort: ' answer
+                case "$answer" in
+                    m|M|migrate) selected=migrate; break ;;
+                    d|D|delete) selected=delete; break ;;
+                    a|A|abort) selected=abort; break ;;
+                    *) warn "enter m, d, or a" ;;
+                esac
+            done
+        else
+            printf 'No automatic migration is available for this schema.\n'
+            printf 'Deletion permanently discards the local database; credentials and the account key are retained.\n'
+            while true; do
+                read -r -p 'Choose [d]elete or [a]bort: ' answer
+                case "$answer" in
+                    d|D|delete) selected=delete; break ;;
+                    a|A|abort) selected=abort; break ;;
+                    *) warn "enter d or a" ;;
+                esac
+            done
+        fi
+    fi
+
+    case "$selected" in
+        migrate)
+            [[ "$database_state" == migratable ]] || fail \
+                "database schema ${existing_schema} cannot be migrated by this release; use --database-action delete or abort"
+            stop_service_for_database_change
+            info "Migrating ${database_path} from schema ${existing_schema} to ${target_schema}"
+            "$DAEMON_SOURCE" --config "$CONFIG_FILE" --installer-migrate-storage \
+                || fail "database migration failed; installed binaries were not changed"
+            ;;
+        delete)
+            delete_existing_database "$database_path"
+            ;;
+        abort)
+            fail "installation stopped without changing the existing database"
+            ;;
+        *) fail "unexpected database action: ${selected}" ;;
+    esac
+}
+
+handle_database_upgrade
+
 info "Creating or updating ${CONFIG_FILE}"
 "$DAEMON_SOURCE" --config "$CONFIG_FILE" --update-config
 
@@ -287,6 +397,9 @@ case ":${PATH}:" in
 esac
 
 if ((START_SERVICE == 0)); then
+    if ((SERVICE_STOPPED_FOR_DATABASE)); then
+        info "kclipd remains stopped because --no-start was selected"
+    fi
     info "Installation complete; service startup was skipped"
     exit 0
 fi
